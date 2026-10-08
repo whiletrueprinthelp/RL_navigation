@@ -1,0 +1,5 @@
+﻿/.venv
+/test_robot_server.py
+.env
+/__pycache__
+/runs
