@@ -157,6 +157,7 @@ def make_instructions(args, w: int, h: int) -> str:
 SETUP
 - A marker is mounted on the camera itself, so it stays at the SAME place in every frame. It never moves in the image.
 - A target is somewhere in front of the robot. Your goal is to make the target's centre sit on the marker's centre, horizontally.
+- target is specifically the black label center on the front bin.
 - Images are {w}x{h} px. x increases to the right. Offset = target_x - marker_x (positive: target is right of the marker).
 - There is no tilt control, so ignore any vertical difference. Only horizontal alignment matters.
 
