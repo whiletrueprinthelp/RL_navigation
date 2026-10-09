@@ -3,3 +3,6 @@
 .env
 /__pycache__
 /runs
+/own_docs/
+aim_agent_v0.py
+
