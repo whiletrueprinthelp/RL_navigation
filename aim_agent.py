@@ -17,10 +17,20 @@ Setup:
     The script loads .env automatically at startup (load_dotenv). Variables already
     exported in the shell take priority over the .env values.
 
-    Put skills.md next to this script (or pass --skills PATH). An optional learned.md
-    (--learned PATH) is added to the prompt if it exists.
+    Put skills.md next to this script (or pass --skills PATH).
 
-    python3 aim_agent.py
+    python3 aim_agent.py              # learns from earlier runs in runs/ (default)
+    python3 aim_agent.py --no-learn   # baseline: no learned notes, base step caps
+
+Learning from past runs (all code-derived, the LLM never writes the notes):
+    At startup the script reads runs/*/log.jsonl, pairs every executed rotate/pan with the
+    offset estimates before and after it, and fits how many pixels of offset one degree of
+    rotation / one pan unit moves (robust least squares, outliers dropped). It also measures
+    how much of the error each correction closed and how often it overshot. The result is
+    written to learned.md (overwritten after every run) and added to the system prompt.
+    Confidence in the calibration (0..1) raises the per-step caps from the base values
+    (--max-rotate, --max-pan) towards the ceilings (--max-rotate-ceiling, --max-pan-ceiling),
+    and overshooting lowers it again. The server's own limits always apply on top.
 
 How a run works (follows the skills.md episode workflow):
     1. GET /status safety check, GET /camera_info, centre the pan servo.
@@ -41,12 +51,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
+import math
 import os
+import statistics
 import sys
 import time
 import traceback
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -143,14 +156,21 @@ def add_grid(jpeg: bytes, every: int = 80) -> bytes:
     return buf.tobytes() if ok else jpeg
 
 
-def make_caps(lim: dict, args) -> dict:
-    """Effective action limits: the tighter of the server's limits (from /status) and my caps."""
+def make_caps(lim: dict, args, L: Optional["Learned"] = None) -> dict:
+    """Effective action limits: the tighter of the server's limits (from /status) and my caps.
+    Rotate and pan caps start at the base values and grow towards the ceilings with the
+    learned calibration confidence (0 without history = base caps, same as before)."""
     pmin, pmax = int(lim.get("pan_min", 0)), int(lim.get("pan_max", 1000))
+    rot_hi, pan_hi = max(args.max_rotate, args.max_rotate_ceiling), max(args.max_pan, args.max_pan_ceiling)
+    c_rot, c_pan = (L.rot.conf, L.pan.conf) if L else (0.0, 0.0)
+    rot = args.max_rotate + c_rot * (rot_hi - args.max_rotate)
+    pan = args.max_pan + c_pan * (pan_hi - args.max_pan)
     return dict(
-        rot=min(args.max_rotate, float(lim.get("max_rotate_deg", 90.0))),
+        rot=round(min(rot, float(lim.get("max_rotate_deg", 90.0))), 1),
         move=min(args.max_move, float(lim.get("max_move_m", 0.30))),
         speed=float(lim.get("default_speed_mps", 0.08)),
-        pan_min=pmin, pan_max=pmax, pan_center=(pmin + pmax) // 2, pan_step=args.max_pan,
+        pan_min=pmin, pan_max=pmax, pan_center=(pmin + pmax) // 2, pan_step=int(round(pan)),
+        rot_base=args.max_rotate, rot_ceil=rot_hi, pan_base=args.max_pan, pan_ceil=pan_hi,
         pan_dur=clamp(args.pan_duration, float(lim.get("pan_min_duration_s", 0.02)),
                       float(lim.get("pan_max_duration_s", 2.0))),
     )
@@ -177,6 +197,214 @@ def wait_gyro(robot: Robot, timeout: float = 20.0) -> bool:
             return True
         time.sleep(1.0)
     return False
+
+
+# -------------------------------------------------------------------- learning
+@dataclass
+class Calib:
+    n: int = 0
+    k: Optional[float] = None          # change of the offset (px) per degree / per pan unit
+    rel_err: Optional[float] = None    # standard error of k, relative to |k|
+    agree: Optional[float] = None      # share of samples whose direction matches k
+    conf: float = 0.0                  # 0..1: how far to trust k
+
+
+@dataclass
+class Learned:
+    rot: Calib = field(default_factory=Calib)
+    pan: Calib = field(default_factory=Calib)
+    episodes: int = 0
+    successes: int = 0
+    med_steps_ok: Optional[float] = None
+    fails: Counter = field(default_factory=Counter)
+    big_moves: int = 0                 # corrections made while the offset exceeded 2 x tolerance
+    overshoot: Optional[float] = None  # share of those that flipped past the marker
+    closed: Optional[float] = None     # median share of the error closed by those corrections
+    text: str = ""
+
+
+def read_runs(out_dir, window: int, exclude: Optional[str] = None):
+    """[(episode_id, log rows, summary or None)] for the newest `window` episodes."""
+    dirs = sorted(d for d in Path(out_dir).glob("*") if (d / "log.jsonl").exists() and d.name != exclude)
+    runs = []
+    for d in dirs[-window:]:
+        rows = []
+        try:
+            for line in (d / "log.jsonl").read_text(encoding="utf-8").splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass                                    # half-written or foreign line
+        except OSError:
+            continue
+        try:
+            summ = json.loads((d / "episode_summary.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            summ = None
+        runs.append((d.name, rows, summ))
+    return runs
+
+
+def transitions(rows):
+    """One (kind, amount, d_offset, offset_before, offset_after) per executed rotate/pan whose
+    before and after offsets were both estimated with the target visible."""
+    out = []
+    for r in rows:
+        try:
+            if r.get("server_status") != "done":
+                continue
+            det = r.get("details") or {}
+            if r.get("route_called") == "POST /rotate":
+                kind, amt = "rot", det.get("measured_deg")      # what the gyro says was turned
+                if amt is None:
+                    amt = det.get("sent_deg")
+            elif r.get("route_called") == "POST /camera/pan":
+                kind, amt = "pan", det.get("sent_delta")
+            else:
+                continue
+            cur, nxt = r.get("state_summary") or {}, r.get("next_state") or {}
+            o1, o2 = cur.get("est_offset_px"), nxt.get("est_offset_px")
+            if amt is None or o1 is None or o2 is None:
+                continue
+            if not (cur.get("target_visible") and nxt.get("target_visible")):
+                continue
+            out.append((kind, float(amt), float(o2) - float(o1), float(o1), float(o2)))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out
+
+
+def fit_slope(samples, min_amt: float, min_n: int) -> Calib:
+    """Least squares through the origin of d_offset on amount, with one round of outlier removal.
+    Large moves weigh more, so noisy estimates after tiny moves do little harm."""
+    pts = [(a, d) for a, d in samples if abs(a) >= min_amt]
+    if len(pts) < 2:
+        return Calib(n=len(pts))
+
+    def slope(p):
+        return sum(a * d for a, d in p) / sum(a * a for a, _ in p)
+
+    k = slope(pts)
+    if len(pts) >= 6:
+        res = [d - k * a for a, d in pts]
+        med = statistics.median(res)
+        mad = 1.4826 * statistics.median(abs(x - med) for x in res)
+        if mad > 0:
+            keep = [p for p, x in zip(pts, res) if abs(x - med) <= 3 * mad]
+            if len(keep) >= max(4, len(pts) // 2):
+                pts, k = keep, slope(keep)
+    n, saa = len(pts), sum(a * a for a, _ in pts)
+    se = math.sqrt(sum((d - k * a) ** 2 for a, d in pts) / max(n - 1, 1) / saa)
+    c = Calib(n=n, k=k, rel_err=(se / abs(k)) if k else None,
+              agree=sum(1 for a, d in pts if d * k * a > 0) / n)
+    if k and n >= min_n and c.agree >= 0.75:
+        c.conf = clamp(1 - c.rel_err / 0.4, 0.0, 1.0) * min(1.0, n / (2.0 * min_n))
+    return c
+
+
+def learn(out_dir, args, exclude: Optional[str] = None) -> Learned:
+    L, rot_s, pan_s, trans, ok_steps = Learned(), [], [], [], []
+    for _, rows, summ in read_runs(out_dir, args.learn_window, exclude):
+        tr = transitions(rows)
+        trans += tr
+        for kind, a, d, _, _ in tr:
+            (rot_s if kind == "rot" else pan_s).append((a, d))
+        if summ:
+            L.episodes += 1
+            if summ.get("status") == "success":
+                L.successes += 1
+                ok_steps.append(summ.get("steps") or 0)
+            else:
+                L.fails[str(summ.get("termination_reason") or "unknown").split(":")[0]] += 1
+    L.med_steps_ok = statistics.median(ok_steps) if ok_steps else None
+    L.rot = fit_slope(rot_s, args.min_rot_deg, args.min_samples)
+    L.pan = fit_slope(pan_s, args.min_pan_units, args.min_samples)
+    big = [(o1, o2) for _, _, _, o1, o2 in trans if abs(o1) > 2 * args.tol]
+    L.big_moves = len(big)
+    if big:
+        # overshoot = landed on the other side of the marker by more than a quarter of the starting
+        # error (and more than 2 x tolerance), so ordinary noise in the estimates does not count
+        L.overshoot = sum(1 for o1, o2 in big
+                          if o1 * o2 < 0 and abs(o2) > max(2 * args.tol, 0.25 * abs(o1))) / len(big)
+        L.closed = statistics.median((abs(o1) - abs(o2)) / abs(o1) for o1, o2 in big)
+        damp = 1 - min(1.0, L.overshoot / 0.3)              # overshooting pulls confidence back down
+        L.rot.conf *= damp
+        L.pan.conf *= damp
+    return L
+
+
+def render_notes(L: Learned, caps: dict, args, w: int, hfov: float) -> str:
+    """The learned.md text: facts measured from past runs, in the units the LLM acts in."""
+    ppd = w / hfov
+    out = ["# Learned notes (measured by the backend from past episodes; rewritten after every run)", "",
+           "## Track record"]
+    if L.episodes:
+        s = "- %d past episodes, %d succeeded" % (L.episodes, L.successes)
+        if L.med_steps_ok is not None:
+            s += " (median %g steps to succeed)" % L.med_steps_ok
+        out.append(s)
+        if L.fails:
+            out.append("- Failures: " + ", ".join("%s x%d" % kv for kv in L.fails.most_common()))
+    else:
+        out.append("- No past episodes yet.")
+
+    out += ["", "## Calibration (offset = target_x - marker_x in px; derived from your own earlier estimates)"]
+    c = L.rot
+    if c.k is not None:
+        trust = "reliable" if c.conf >= 0.5 else ("usable" if c.conf > 0 else "not yet reliable, treat as a hint")
+        out.append("- rotate_robot: +1 deg changes the offset by about %+.1f px (n=%d, error about %.0f%%, "
+                   "confidence %.2f, %s). To cancel an offset of X px use amount = -X / %.1f."
+                   % (c.k, c.n, 100 * (c.rel_err or 0), c.conf, trust, c.k))
+    else:
+        out.append("- rotate_robot: not measured yet. Field-of-view prior: about %+.1f px per degree "
+                   "(expected sign: +1 deg raises the offset). Check the sign on your first rotate." % ppd)
+    c = L.pan
+    if c.k is not None:
+        trust = "reliable" if c.conf >= 0.5 else ("usable" if c.conf > 0 else "not yet reliable, treat as a hint")
+        out.append("- pan_camera: +1 unit changes the offset by about %+.2f px (n=%d, error about %.0f%%, "
+                   "confidence %.2f, %s). To cancel an offset of X px use amount = -X / %.2f."
+                   % (c.k, c.n, 100 * (c.rel_err or 0), c.conf, trust, c.k))
+    elif args.pan_prior_deg_per_unit > 0:
+        out.append("- pan_camera: not measured yet. UNVERIFIED guess: if 1000 units span about 240 deg (typical "
+                   "for this kind of bus servo) one unit is about %.2f px in size; the DIRECTION is unknown. "
+                   "Make your first pan a probe of about 40 units, see which way the target moved, then size "
+                   "later pans from that." % (args.pan_prior_deg_per_unit * ppd))
+    else:
+        out.append("- pan_camera: scale and direction not measured yet. Make your first pan a probe of about "
+                   "40 units and size later pans from what you see.")
+
+    out += ["", "## Correction behaviour"]
+    if L.big_moves >= 3 and L.closed is not None:
+        verdict = "sizing looks about right."
+        if L.overshoot >= 0.3:
+            verdict = "you have been OVERSHOOTING: use a smaller share of the error until it settles."
+        elif L.closed < 0.6 and L.overshoot < 0.15:
+            verdict = "you have been UNDER-CORRECTING: apply the full computed correction, do not nudge."
+        out.append("- %d earlier corrections started with the offset above 2 x tolerance: the median one closed "
+                   "%.0f%% of the error and %.0f%% overshot past the marker by more than a quarter of the starting error; %s"
+                   % (L.big_moves, 100 * L.closed, 100 * L.overshoot, verdict))
+    else:
+        out.append("- Not enough earlier corrections to judge sizing yet.")
+    f_rot = 0.6 if (L.overshoot or 0) >= 0.3 else 0.7 + 0.3 * L.rot.conf
+    f_pan = 0.6 if (L.overshoot or 0) >= 0.3 else 0.7 + 0.3 * L.pan.conf
+    out.append("- Correct about %d%% of the remaining error per rotate step and about %d%% per pan step. "
+               "If the amount you computed is inside the step limit, send it in one move instead of "
+               "splitting it into several small ones." % (round(100 * f_rot), round(100 * f_pan)))
+
+    out += ["", "## Step limits now allowed",
+            "- rotate_robot up to %g deg per step (base %g, ceiling %g); pan_camera up to %d units per step "
+            "(base %g, ceiling %g)." % (caps["rot"], caps["rot_base"], caps["rot_ceil"], caps["pan_step"],
+                                        caps["pan_base"], caps["pan_ceil"]),
+            "- The limits grow with calibration confidence and shrink if overshooting appears. The server's "
+            "own limits always apply."]
+    return "\n".join(out) + "\n"
+
+
+def write_notes(path, text: str):
+    try:
+        Path(path).write_text(text, encoding="utf-8")
+    except OSError as e:
+        print("warning: could not write %s: %s" % (path, e))
 
 
 # ------------------------------------------------------------------------- LLM
@@ -228,8 +456,7 @@ def make_addendum(args, w: int, h: int, hfov: float, caps: dict) -> str:
 PERCEPTION
 - There is NO local marker/target detector. You are the only perception: look at the frame, find the marker and the target yourself, and estimate the offset. Ignore the playbook's detection confidences, normalized errors and transition storage: the backend does the bookkeeping, you only call act().
 - A marker is mounted on the camera itself, so it stays at the SAME place in every frame and never moves in the image. The target is somewhere in front of the robot.
-- target is
-  specifically the black label center on the front bin.
+- target is specifically a blue water bottle.
 - GOAL: make the target's centre sit on the marker's centre, horizontally. There is no tilt control, so ignore any vertical difference.
 - Images are {w}x{h} px, x increases to the right. offset = target_x - marker_x (positive: target is right of the marker).
 
@@ -244,7 +471,8 @@ RULES
 - Any server refusal, abort or busy reply ends the episode, so keep every request inside the limits.
 - If target_visible is false for {args.n_lost_max} steps in a row, recovery mode starts: only pan_camera is allowed for the first {args.recovery_pan_steps} recovery steps, then only rotate_robot, and the episode fails after {args.recovery_max} recovery steps. It ends as soon as you see the target again.
 - Learn what each action did from the previous frame and the history. If a step made things worse, reverse it.
-- Correct about 70-80% of the estimated error per step and use smaller steps near the target to avoid overshoot.
+- SIZING: work out the correction from the calibration (amount = -offset / px-per-unit) and send it in ONE move when it fits inside the step limit. Apply the share of the error stated in LEARNED NOTES (70% if there are no notes). Only when the target is within about {3 * args.tol:g} px of the marker, switch to fine corrections.
+- The playbook's *_SMALL action names are labels, not a size requirement: the size is the amount you pass, up to the limits above. In the real reward the motion penalty is tiny ({args.control_penalty:g} per motion step) and the main term is the progress made per step, so one correct larger move scores better than several timid ones. Cautious tiny steps are only right when you are unsure of the direction or scale.
 - Always answer by calling act(). Keep the observation short."""
     if not args.no_prior:
         text += (f"\n- Rough prior: the horizontal field of view is about {hfov:.0f} degrees across the full "
@@ -437,7 +665,7 @@ def run(args):
     skills = load_text(args.skills)
     if skills is None:
         sys.exit("skills file not found: %s (pass --skills PATH)" % args.skills)
-    learned = load_text(args.learned, strip_frontmatter=False) if args.learned else None
+    learned = None                       # learned notes text, built below from earlier runs
 
     robot = Robot(os.environ.get("ROBOT_URL", "http://localhost:8081"), os.environ.get("ROBOT_TOKEN", ""))
     client = make_client()
@@ -453,7 +681,7 @@ def run(args):
     why = safety_reason(st)
     if why:
         sys.exit("Not safe to start: " + why)
-    caps = make_caps(st.get("limits") or {}, args)
+    lim = st.get("limits") or {}
     try:
         ci = robot.camera_info()
         hfov = float(ci.get("horizontal_fov_deg", DEFAULT_HFOV_DEG))
@@ -461,6 +689,16 @@ def run(args):
     except Exception as e:
         print("warning: /camera_info failed (%s), using defaults" % e)
         hfov, w0, h0 = DEFAULT_HFOV_DEG, 640, 480
+    L = None if args.no_learn else learn(args.out, args, exclude=episode_id)   # learn from earlier runs
+    caps = make_caps(lim, args, L)
+    if L is not None:
+        learned = L.text = render_notes(L, caps, args, w0, hfov)
+        write_notes(args.learned, learned)
+        print("learning: %d past episodes | rotate k=%s conf %.2f | pan k=%s conf %.2f | caps: rotate %g deg, pan %d units"
+              % (L.episodes, "n/a" if L.rot.k is None else "%+.1f" % L.rot.k, L.rot.conf,
+                 "n/a" if L.pan.k is None else "%+.2f" % L.pan.k, L.pan.conf, caps["rot"], caps["pan_step"]))
+    else:
+        print("learning off (--no-learn): base step caps, no learned notes")
     print("battery_mv:", st.get("battery_mv"), "| gyro_ready:", st.get("gyro_ready"),
           "| image %dx%d, hfov %.1f deg" % (w0, h0, hfov))
     if not st.get("gyro_ready") and not wait_gyro(robot):
@@ -582,21 +820,46 @@ def run(args):
         summary = dict(episode_id=episode_id, mode="llm_pure_vision", status=status,
                        total_reward=round(ep.total_reward, 3), steps=ep.steps,
                        duration_s=round(time.time() - ep.t0, 1), final_alignment_error_px=ep.last_err,
-                       error_source="llm_estimate", termination_reason=reason, model=model)
+                       error_source="llm_estimate", termination_reason=reason, model=model,
+                       policy=dict(learning=not args.no_learn, rotate_cap_deg=caps["rot"],
+                                   pan_cap_units=caps["pan_step"],
+                                   conf_rot=round(L.rot.conf, 3) if L else None,
+                                   conf_pan=round(L.pan.conf, 3) if L else None,
+                                   notes_sha=hashlib.sha1((learned or "").encode()).hexdigest()[:10]))
         (run_dir / "episode_summary.json").write_text(json.dumps(summary, indent=2))
         print("\nEpisode %s: %s (%s) | reward %.2f | %d steps" % (episode_id, status, reason, ep.total_reward, ep.steps))
         print("Log and frames saved in", run_dir)
+        if not args.no_learn:                                   # fold this episode into the notes
+            try:
+                L2 = learn(args.out, args)
+                caps2 = make_caps(lim, args, L2)
+                write_notes(args.learned, render_notes(L2, caps2, args, w0, hfov))
+                print("learned notes updated (%s): next run's caps rotate %g deg, pan %d units"
+                      % (args.learned, caps2["rot"], caps2["pan_step"]))
+            except Exception as e:
+                print("warning: could not update learned notes:", e)
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="LLM aiming loop (pure-vision perception, skills.md playbook).")
     ap.add_argument("--skills", default=str(Path(__file__).with_name("skills.md")), help="playbook file")
-    ap.add_argument("--learned", default="learned.md", help="optional learned notes file (used if it exists)")
+    ap.add_argument("--learned", default="learned.md", help="learned notes file, rewritten after every run")
+    ap.add_argument("--no-learn", action="store_true", help="baseline: ignore past runs, no learned notes")
+    ap.add_argument("--learn-window", type=int, default=20, help="newest episodes in --out to learn from")
+    ap.add_argument("--min-samples", type=int, default=5, help="calibration samples needed before it is trusted")
+    ap.add_argument("--min-rot-deg", type=float, default=2.0, help="smallest rotation used for calibration")
+    ap.add_argument("--min-pan-units", type=float, default=15.0, help="smallest pan used for calibration")
+    ap.add_argument("--pan-prior-deg-per-unit", type=float, default=0.24,
+                    help="unverified guess of degrees per pan unit for the first runs (0 = give no guess)")
     ap.add_argument("--max-steps", type=int, default=25)
     ap.add_argument("--tol", type=float, default=10.0, help="px tolerance for alignment")
     ap.add_argument("--k-stable", type=int, default=3, help="consecutive confirmations needed for success")
-    ap.add_argument("--max-rotate", type=float, default=10.0, help="deg per rotate step (server allows 90)")
-    ap.add_argument("--max-pan", type=float, default=60.0, help="servo units per pan step")
+    ap.add_argument("--max-rotate", type=float, default=10.0, help="base deg per rotate step before calibration")
+    ap.add_argument("--max-rotate-ceiling", type=float, default=25.0,
+                    help="deg per rotate step at full calibration confidence (server allows 90)")
+    ap.add_argument("--max-pan", type=float, default=60.0, help="base servo units per pan step")
+    ap.add_argument("--max-pan-ceiling", type=float, default=250.0,
+                    help="units per pan step at full calibration confidence")
     ap.add_argument("--max-move", type=float, default=0.10, help="metres per move step (server allows 0.30)")
     ap.add_argument("--pan-duration", type=float, default=0.3)
     ap.add_argument("--settle", type=float, default=0.3, help="extra wait after a pan, seconds")
