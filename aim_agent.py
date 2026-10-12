@@ -456,7 +456,6 @@ def make_addendum(args, w: int, h: int, hfov: float, caps: dict) -> str:
 PERCEPTION
 - There is NO local marker/target detector. You are the only perception: look at the frame, find the marker and the target yourself, and estimate the offset. Ignore the playbook's detection confidences, normalized errors and transition storage: the backend does the bookkeeping, you only call act().
 - A marker is mounted on the camera itself, so it stays at the SAME place in every frame and never moves in the image. The target is somewhere in front of the robot.
-- target is specifically a blue water bottle.
 - GOAL: make the target's centre sit on the marker's centre, horizontally. There is no tilt control, so ignore any vertical difference.
 - Images are {w}x{h} px, x increases to the right. offset = target_x - marker_x (positive: target is right of the marker).
 
@@ -689,10 +688,12 @@ def run(args):
     except Exception as e:
         print("warning: /camera_info failed (%s), using defaults" % e)
         hfov, w0, h0 = DEFAULT_HFOV_DEG, 640, 480
+    # width of the frames the model will actually see (the server only shrinks, never enlarges)
+    w_eff = args.width if args.width and 32 <= args.width < w0 else w0
     L = None if args.no_learn else learn(args.out, args, exclude=episode_id)   # learn from earlier runs
     caps = make_caps(lim, args, L)
     if L is not None:
-        learned = L.text = render_notes(L, caps, args, w0, hfov)
+        learned = L.text = render_notes(L, caps, args, w_eff, hfov)
         write_notes(args.learned, learned)
         print("learning: %d past episodes | rotate k=%s conf %.2f | pan k=%s conf %.2f | caps: rotate %g deg, pan %d units"
               % (L.episodes, "n/a" if L.rot.k is None else "%+.1f" % L.rot.k, L.rot.conf,
@@ -833,7 +834,7 @@ def run(args):
             try:
                 L2 = learn(args.out, args)
                 caps2 = make_caps(lim, args, L2)
-                write_notes(args.learned, render_notes(L2, caps2, args, w0, hfov))
+                write_notes(args.learned, render_notes(L2, caps2, args, w_eff, hfov))
                 print("learned notes updated (%s): next run's caps rotate %g deg, pan %d units"
                       % (args.learned, caps2["rot"], caps2["pan_step"]))
             except Exception as e:
