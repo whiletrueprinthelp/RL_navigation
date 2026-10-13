@@ -34,12 +34,23 @@ Learning from past runs (all code-derived, the LLM never writes the notes):
 
 How a run works (follows the skills.md episode workflow):
     1. GET /status safety check, GET /camera_info, centre the pan servo.
-    2. Every step: GET /status (stale IMU / low battery -> stop), GET /image, send the
+    2. SEARCH stage (new, replaces the old recovery mode). The run starts here. Every step the
+       LLM still looks at the frame and reports target_visible, but the CODE moves the robot:
+       it turns in fixed steps (--scan-step, default 50 deg, less than the field of view so views
+       overlap) in one direction, tracking the turned angle from the gyro, until a full circle has
+       been viewed. The target must be seen on --acquire-frames frames in a row (default 2, the
+       first sighting is a no-motion confirmation) before the run moves on to alignment. If
+       nothing is found after the full circle the run ends with "target not found after a full
+       scan". Searching has its own step budget (--max-search-steps) and does not use up the
+       alignment steps (--max-steps).
+    3. ALIGN stage: every step: GET /status (stale IMU / low battery -> stop), GET /image, send the
        frame(s) to the LLM, the LLM calls act() with an action, the action is clipped to
-       the limits from /status and run on the exact server route.
-    3. Hard rules: the first server refused|aborted|busy ends the episode; the episode
+       the limits from /status and run on the exact server route. If the target is lost for
+       --n-lost-max steps in a row the SEARCH stage starts again, turning first towards the side
+       where the target was last seen.
+    4. Hard rules: the first server refused|aborted|busy ends the episode; the episode
        always ends with POST /stop.
-    4. Success = the LLM confirms alignment on K_STABLE consecutive steps.
+    5. Success = the LLM confirms alignment on K_STABLE consecutive steps.
 
 Perception is the LLM only: it finds the marker and target in the image and estimates the
 offset. The reward is therefore computed from the LLM's own estimates (a noisy proxy).
@@ -455,7 +466,7 @@ def make_addendum(args, w: int, h: int, hfov: float, caps: dict) -> str:
 
 PERCEPTION
 - There is NO local marker/target detector. You are the only perception: look at the frame, find the marker and the target yourself, and estimate the offset. Ignore the playbook's detection confidences, normalized errors and transition storage: the backend does the bookkeeping, you only call act().
-- A marker is mounted on the camera itself, so it stays at the SAME place in every frame and never moves in the image. The target is somewhere in front of the robot.
+- A marker is mounted on the camera itself, so it stays at the SAME place in every frame and never moves in the image. The marker is a sharp pointy blob. The target is a green wall.
 - GOAL: make the target's centre sit on the marker's centre, horizontally. There is no tilt control, so ignore any vertical difference.
 - Images are {w}x{h} px, x increases to the right. offset = target_x - marker_x (positive: target is right of the marker).
 
@@ -468,7 +479,7 @@ HOW TO ACT (call act() every step)
 
 RULES
 - Any server refusal, abort or busy reply ends the episode, so keep every request inside the limits.
-- If target_visible is false for {args.n_lost_max} steps in a row, recovery mode starts: only pan_camera is allowed for the first {args.recovery_pan_steps} recovery steps, then only rotate_robot, and the episode fails after {args.recovery_max} recovery steps. It ends as soon as you see the target again.
+- SEARCH: when the target is not visible, the backend takes over and turns the robot itself, in steps of about {getattr(args, 'scan_step_eff', args.scan_step):g} degrees, until it is seen on {args.acquire_frames} frames in a row. While the message says SEARCH MODE you only report target_visible and your offset estimate; your motion requests are ignored (on the frame where the target is first seen the backend holds still to confirm it, and on the confirming frame it runs the alignment action you chose). If target_visible is false for {args.n_lost_max} steps in a row during alignment, the search starts again.
 - Learn what each action did from the previous frame and the history. If a step made things worse, reverse it.
 - SIZING: work out the correction from the calibration (amount = -offset / px-per-unit) and send it in ONE move when it fits inside the step limit. Apply the share of the error stated in LEARNED NOTES (70% if there are no notes). Only when the target is within about {3 * args.tol:g} px of the marker, switch to fine corrections.
 - The playbook's *_SMALL action names are labels, not a size requirement: the size is the amount you pass, up to the limits above. In the real reward the motion penalty is tiny ({args.control_penalty:g} per motion step) and the main term is the progress made per step, so one correct larger move scores better than several timid ones. Cautious tiny steps are only right when you are unsure of the direction or scale.
@@ -529,16 +540,13 @@ def image_part(b64: str, detail: str) -> dict:
     return {"type": "input_image", "image_url": "data:image/jpeg;base64," + b64, "detail": detail}
 
 
-def build_content(step, args, ep, state, caps, st, history, b64, prev_b64, w, h, in_rec):
+def build_content(step, args, ep, state, caps, st, history, b64, prev_b64, w, h, note=None):
     lines = [f"Step {step} of {args.max_steps}. Image size {w}x{h} px.",
              f"Pan servo position: {state.pan_pos} (allowed {caps['pan_min']}-{caps['pan_max']}). "
              f"Robot heading from gyro: {st.get('heading_deg')} deg. Battery: {st.get('battery_mv')} mV.",
              f"Alignment confirmations so far: {ep.stable}/{args.k_stable}."]
-    if in_rec:
-        only = "pan_camera" if ep.rec_steps < args.recovery_pan_steps else "rotate_robot"
-        lines.append(f"RECOVERY MODE: the target was not visible for {ep.lost} steps in a row. "
-                     f"Recovery step {ep.rec_steps + 1} of {args.recovery_max}. Only {only} is allowed "
-                     f"until you see the target again.")
+    if note:
+        lines.append(note)
     lines.append("Recent history:\n" + ("\n".join(history) if history else "(none yet - this is the first step)"))
     content = [{"type": "input_text", "text": "\n".join(lines)}]
     if prev_b64:
@@ -547,6 +555,53 @@ def build_content(step, args, ep, state, caps, st, history, b64, prev_b64, w, h,
     content += [{"type": "input_text", "text": "CURRENT frame:"}, image_part(b64, args.detail),
                 {"type": "input_text", "text": "Call act() with your next action."}]
     return content
+
+
+# ---------------------------------------------------------------------- search
+@dataclass
+class Search:
+    """State of the SEARCH stage. The code, not the LLM, decides every search motion."""
+    active: bool = True        # True while searching
+    dir: int = 1               # +1 = turn left, -1 = turn right (one direction per scan)
+    cum: float = 0.0           # degrees turned in this scan (gyro measured)
+    rots: int = 0              # scan rotations made in this scan
+    confirm: int = 0           # consecutive frames on which the target was seen
+    scans: int = 1             # scans started in this episode (the first one included)
+    steps: int = 0             # LLM steps spent searching, all scans together
+    found_step: Optional[int] = None
+
+
+def scan_plan(args, hfov: float, server_max_rot: float):
+    """(degrees per scan step, rotations per scan). Views are taken at 0, s, 2s ... degrees. A full
+    circle is covered once the last view reaches 360 - hfov, so the rotations needed are
+    ceil(laps * (360 - hfov) / s). The step stays below the field of view so that views overlap."""
+    step = clamp(args.scan_step, 10.0, min(0.85 * hfov, server_max_rot))
+    return step, max(1, math.ceil(args.scan_laps * (360.0 - hfov) / step))
+
+
+def pick_dir(args, last_off: Optional[float]) -> int:
+    """+1 = turn left, -1 = turn right. offset = target_x - marker_x, so a positive offset means the
+    target was last seen on the right: turn right (negative) to bring that side into view."""
+    if args.scan_dir == "left":
+        return 1
+    if args.scan_dir == "right":
+        return -1
+    if last_off is not None and last_off != 0:
+        return -1 if last_off > 0 else 1
+    return 1
+
+
+def recenter_pan(robot: Robot, state: "State", caps: dict, args):
+    """Search turns the whole robot, so the camera should look straight ahead first."""
+    if state.pan_pos == caps["pan_center"]:
+        return
+    dur = min(1.0, caps["pan_dur"] * 3 + 0.7)
+    r = robot.pan(caps["pan_center"], dur)
+    if r.get("status") == "done":
+        state.pan_pos = caps["pan_center"]
+        time.sleep(dur + args.settle)
+    else:
+        print("warning: could not re-centre the pan servo before the scan:", r.get("reason"))
 
 
 # ------------------------------------------------------------------- execution
@@ -563,7 +618,8 @@ class Episode:
     total_reward: float = 0.0
     stable: int = 0            # consecutive confirmed-aligned steps
     lost: int = 0              # consecutive target_visible=false reports
-    rec_steps: int = 0         # recovery steps used
+    align_steps: int = 0       # steps spent in the ALIGN stage (limited by --max-steps)
+    last_off: Optional[float] = None   # last offset (px) the LLM reported with the target visible
     local_faults: int = 0      # consecutive invalid (locally refused) actions
     last_err: Optional[float] = None
     pending: Optional[dict] = None
@@ -710,11 +766,27 @@ def run(args):
     time.sleep(1.3)
     print("episode:", episode_id, "| dir:", run_dir)
 
+    server_max_rot = float(lim.get("max_rotate_deg", 90.0))
+    scan_step, scan_rots = scan_plan(args, hfov, server_max_rot)
+    args.scan_step_eff = scan_step
+    scap = dict(caps, rot=min(scan_step, server_max_rot))      # search turns are bigger than alignment turns
+    S = Search(dir=pick_dir(args, None))
+    print("search: %d views of %.0f deg field of view, turning %.0f deg per step (%s), up to %d rotations "
+          "= %.0f deg per scan, target must be seen on %d frame(s) in a row"
+          % (scan_rots + 1, hfov, scan_step, "left" if S.dir > 0 else "right", scan_rots, scan_rots * scan_step,
+             args.acquire_frames))
+
     history: deque = deque(maxlen=args.history)
     prev_b64, termination = None, None
     try:
-        for step in range(1, args.max_steps + 1):
+        for step in range(1, args.max_steps + args.max_search_steps + 1):
             ep.steps = step
+            if S.active and S.steps >= args.max_search_steps:
+                termination = ("failure", "search budget exhausted: target not found", False)
+                break
+            if not S.active and ep.align_steps >= args.max_steps:
+                termination = ("failure", "step limit reached", False)
+                break
 
             # 2. observe: /status safety check, then the frame
             st = robot.status()
@@ -731,9 +803,20 @@ def run(args):
             ep.w = w
 
             # 3-4. ask the LLM
-            in_rec = ep.lost >= args.n_lost_max
+            phase0 = "search" if S.active else "align"
+            note = None
+            if S.active:
+                if S.confirm:
+                    note = ("SEARCH MODE (confirming): the target was visible on the last frame and the robot has "
+                            "not moved. Report honestly whether it is visible now. If it is, choose your alignment "
+                            "action as usual and the backend will run it; if not, set action to hold.")
+                else:
+                    note = ("SEARCH MODE: the backend is scanning for the target (scan %d, view %d of %d, turned "
+                            "%.0f deg so far). Report target_visible and your offset estimate only; your motion "
+                            "request is ignored while the target is not yet confirmed. If you can see the target, "
+                            "also choose the alignment action you would take." % (S.scans, S.rots + 1, scan_rots + 1, S.cum))
             content = build_content(step, args, ep, state, caps, st, history, b64,
-                                    None if args.no_prev else prev_b64, w, h, in_rec)
+                                    None if args.no_prev else prev_b64, w, h, note)
             t0 = time.time()
             d, resp = ask_llm(client, model, make_instructions(args, skills, learned, w, h, hfov, caps),
                               content, args.effort)
@@ -742,7 +825,9 @@ def run(args):
             off, vis = d.get("estimated_offset_px"), bool(d.get("target_visible"))
             err = abs(off) if (vis and off is not None) else None
             ep.last_err = err if err is not None else ep.last_err
-            print(f"[{step}] {llm_s:.1f}s  {action} {amount}  offset~{off}  vis={vis}  | {d['observation'][:90]}")
+            if vis and off is not None:
+                ep.last_off = off
+            print(f"[{step}] {phase0}  {llm_s:.1f}s  {action} {amount}  offset~{off}  vis={vis}  | {d['observation'][:90]}")
 
             now = dict(est_offset_px=off, abs_err_px=err, target_visible=vis,
                        heading_deg=st.get("heading_deg"), battery_mv=st.get("battery_mv"),
@@ -752,36 +837,73 @@ def run(args):
 
             # 5-6. gate and execute the action
             term, result = None, None
-            if in_rec and not vis and ep.rec_steps >= args.recovery_max:
-                result = {"route": None, "status": "not_executed", "reason": "recovery exhausted", "fault": None}
-                term = ("failure", "recovery exhausted: target not found", False)
-            elif action == "finish":
-                if not vis or off is None or abs(off) > args.tol:
-                    ep.stable = 0
-                    result = local_refusal("finish needs the target visible and within %g px" % args.tol)
-                else:
-                    ep.stable += 1
-                    result = {"route": None, "status": "done", "fault": None,
-                              "reason": "confirming alignment %d/%d" % (ep.stable, args.k_stable)}
-                    if ep.stable >= args.k_stable:
-                        term = ("success", "aligned for %d consecutive steps" % args.k_stable, True)
-            else:
+            if S.active:                                       # SEARCH: the code moves the robot, not the LLM
                 ep.stable = 0
-                gate = None
-                if in_rec and not vis:
-                    only = "pan_camera" if ep.rec_steps < args.recovery_pan_steps else "rotate_robot"
-                    ep.rec_steps += 1
-                    if action not in (only, "stop"):
-                        gate = "recovery mode: only %s is allowed now" % only
-                result = local_refusal(gate) if gate else execute(robot, action, amount, state, caps, args)
-                if result.get("terminal"):
+                S.steps += 1
+                if action == "stop":
+                    result = execute(robot, "stop", None, state, caps, args)
                     term = ("failure", "agent requested stop", False)
-                elif result.get("fault") == "server":
-                    term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
+                elif vis:
+                    first_frame_visible = (S.steps == 1 and S.rots == 0 and S.confirm == 0)
+                    if first_frame_visible:
+                        S.active, S.found_step = False, step
+                        print("      search: target already visible on first frame, skipping scan")
+                    else:
+                        S.confirm += 1
+                        if S.confirm >= args.acquire_frames:   # confirmed: switch to ALIGN and run the LLM's action
+                            S.active, S.found_step = False, step
+                            print("      search: target confirmed after %.0f deg of scanning (%d search steps)"
+                                  % (S.cum, S.steps))
+                        else:                                  # first sighting: stand still, look again
+                            action, amount = "hold", None
+                            result = {"route": None, "status": "done", "fault": None,
+                                      "reason": "target seen, confirming on a fresh frame"}
+                else:
+                    S.confirm = 0
+                    if S.rots >= scan_rots:
+                        action, amount = "hold", None
+                        result = {"route": None, "status": "not_executed", "reason": "full scan done", "fault": None}
+                        term = ("failure", "target not found after a full scan (%d views, %.0f deg turned)"
+                                % (S.rots + 1, S.cum), False)
+                    else:
+                        recenter_pan(robot, state, caps, args)
+                        action, amount = "rotate_robot", S.dir * scan_step
+                        result = execute(robot, action, amount, state, scap, args)
+                        if result.get("status") == "done":
+                            got = result.get("measured_deg")
+                            S.cum += abs(float(got if got is not None else result.get("sent_deg", scan_step)))
+                            S.rots += 1
+                            time.sleep(args.scan_settle)       # let the image settle after the turn
+                        elif result.get("fault") == "server":
+                            term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
+            if result is None and term is None:                # ALIGN (also the step on which the target was confirmed)
+                ep.align_steps += 1
+                if action == "finish":
+                    if not vis or off is None or abs(off) > args.tol:
+                        ep.stable = 0
+                        result = local_refusal("finish needs the target visible and within %g px" % args.tol)
+                    else:
+                        ep.stable += 1
+                        result = {"route": None, "status": "done", "fault": None,
+                                  "reason": "confirming alignment %d/%d" % (ep.stable, args.k_stable)}
+                        if ep.stable >= args.k_stable:
+                            term = ("success", "aligned for %d consecutive steps" % args.k_stable, True)
+                else:
+                    ep.stable = 0
+                    result = execute(robot, action, amount, state, caps, args)
+                    if result.get("terminal"):
+                        term = ("failure", "agent requested stop", False)
+                    elif result.get("fault") == "server":
+                        term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
             print("      ->", {k: v for k, v in result.items() if k != "fault"})
 
             # bookkeeping: lost counter, invalid-action counter, pending log record
-            ep.lost, ep.rec_steps = (0, 0) if vis else (ep.lost + 1, ep.rec_steps)
+            ep.lost = 0 if vis else ep.lost + 1
+            if not S.active and not vis and ep.lost >= args.n_lost_max and term is None:
+                S = Search(dir=pick_dir(args, ep.last_off), scans=S.scans + 1, steps=S.steps)   # lost: search again
+                ep.lost = 0
+                print("      search: target lost for %d steps, starting scan %d towards the %s"
+                      % (args.n_lost_max, S.scans, "left" if S.dir > 0 else "right"))
             if result.get("fault") == "local":
                 ep.local_faults += 1
                 if ep.local_faults >= args.max_local_faults and term is None:
@@ -792,7 +914,7 @@ def run(args):
             ep.pending = dict(
                 moved=result.get("route") in MOTION_ROUTES, fault=result.get("fault"),
                 record=dict(
-                    episode_id=episode_id, step_idx=step, timestamp=time.time(), frame=frame_path.name,
+                    episode_id=episode_id, phase=phase0, step_idx=step, timestamp=time.time(), frame=frame_path.name,
                     state_summary=now, observation=d["observation"], action=action, amount=amount,
                     route_called=result.get("route"), server_status=result.get("status"),
                     server_reason=result.get("reason"),
@@ -800,7 +922,8 @@ def run(args):
                              if k not in ("route", "status", "reason", "fault", "terminal")},
                     llm_seconds=round(llm_s, 2),
                     tokens={"in": getattr(usage, "input_tokens", None), "out": getattr(usage, "output_tokens", None)}))
-            history.append(history_line(step, d, result))
+            history.append(("[search] " if phase0 == "search" else "")
+                           + history_line(step, dict(d, action=action, amount=amount), result))
             prev_b64 = b64
             if term:
                 termination = term
@@ -822,6 +945,10 @@ def run(args):
                        total_reward=round(ep.total_reward, 3), steps=ep.steps,
                        duration_s=round(time.time() - ep.t0, 1), final_alignment_error_px=ep.last_err,
                        error_source="llm_estimate", termination_reason=reason, model=model,
+                       align_steps=ep.align_steps,
+                       search=dict(scans=S.scans, search_steps=S.steps, deg_last_scan=round(S.cum, 1),
+                                   found_at_step=S.found_step, scan_step_deg=scan_step,
+                                   views_per_scan=scan_rots + 1, still_searching=S.active),
                        policy=dict(learning=not args.no_learn, rotate_cap_deg=caps["rot"],
                                    pan_cap_units=caps["pan_step"],
                                    conf_rot=round(L.rot.conf, 3) if L else None,
@@ -852,7 +979,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-pan-units", type=float, default=15.0, help="smallest pan used for calibration")
     ap.add_argument("--pan-prior-deg-per-unit", type=float, default=0.24,
                     help="unverified guess of degrees per pan unit for the first runs (0 = give no guess)")
-    ap.add_argument("--max-steps", type=int, default=25)
+    ap.add_argument("--max-steps", type=int, default=25, help="alignment steps (search steps are counted separately)")
     ap.add_argument("--tol", type=float, default=10.0, help="px tolerance for alignment")
     ap.add_argument("--k-stable", type=int, default=3, help="consecutive confirmations needed for success")
     ap.add_argument("--max-rotate", type=float, default=10.0, help="base deg per rotate step before calibration")
@@ -864,9 +991,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-move", type=float, default=0.10, help="metres per move step (server allows 0.30)")
     ap.add_argument("--pan-duration", type=float, default=0.3)
     ap.add_argument("--settle", type=float, default=0.3, help="extra wait after a pan, seconds")
-    ap.add_argument("--n-lost-max", type=int, default=3, help="steps without the target before recovery")
-    ap.add_argument("--recovery-pan-steps", type=int, default=4, help="recovery steps restricted to pan")
-    ap.add_argument("--recovery-max", type=int, default=8, help="recovery steps before the episode fails")
+    ap.add_argument("--n-lost-max", type=int, default=3, help="steps without the target during alignment before searching again")
+    ap.add_argument("--scan-step", type=float, default=50.0,
+                    help="deg per search rotation (kept below the field of view so views overlap)")
+    ap.add_argument("--scan-laps", type=float, default=1.0, help="full circles to search before giving up")
+    ap.add_argument("--scan-dir", default="auto", choices=["auto", "left", "right"],
+                    help="search direction; auto = towards the side the target was last seen, else left")
+    ap.add_argument("--scan-settle", type=float, default=0.5, help="seconds to wait after each search turn")
+    ap.add_argument("--acquire-frames", type=int, default=2,
+                    help="frames in a row with the target visible before alignment starts (1 = no confirmation)")
+    ap.add_argument("--max-search-steps", type=int, default=30,
+                    help="LLM steps the search stage may use in total (separate from --max-steps)")
     ap.add_argument("--max-local-faults", type=int, default=4, help="invalid actions in a row before failing")
     ap.add_argument("--control-penalty", type=float, default=0.05)
     ap.add_argument("--oscillation-penalty", type=float, default=0.2)
