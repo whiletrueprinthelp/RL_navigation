@@ -462,32 +462,20 @@ def load_text(path, strip_frontmatter: bool = True) -> Optional[str]:
 
 
 def make_addendum(args, w: int, h: int, hfov: float, caps: dict) -> str:
-    text = f"""TASK ADDENDUM (this overrides the playbook above wherever they differ)
-
-PERCEPTION
-- There is NO local marker/target detector. You are the only perception: look at the frame, find the marker and the target yourself, and estimate the offset. Ignore the playbook's detection confidences, normalized errors and transition storage: the backend does the bookkeeping, you only call act().
-- A marker is mounted on the camera itself, so it stays at the SAME place in every frame and never moves in the image. The marker is a sharp pointy blob. The target is a green wall.
-- GOAL: make the target's centre sit on the marker's centre, horizontally. There is no tilt control, so ignore any vertical difference.
-- Images are {w}x{h} px, x increases to the right. offset = target_x - marker_x (positive: target is right of the marker).
-
-HOW TO ACT (call act() every step)
-- rotate_robot(amount): degrees, positive = turn left. Minimum {MIN_ROTATE_DEG:g}, at most {caps['rot']:g} per step, precision about 1 degree. Turning left normally shifts the scene right in the image; check against what you see.
-- pan_camera(amount): change in servo position, range {caps['pan_min']}-{caps['pan_max']}, at most {caps['pan_step']:g} units per step. Its direction and pixels-per-unit scale are NOT known: work them out from the previous and current frames and your history. Good for fine corrections.
-- move_forward / move_backward / move_left / move_right(amount): metres, positive, at most {caps['move']:g} per step. Open loop (time based), so it is imprecise and it changes the scene. Prefer rotate and pan; use a move only if they cannot help.
-- hold: no motion for one step. stop: calls /stop and ends the episode as a failure (use only if something looks unsafe).
-- finish: use only when the target centre is within about {args.tol:g} px of the marker centre. Success needs {args.k_stable} consecutive finish calls, each on a fresh frame (nothing moves in between). Any other action resets that count. Never finish when the target is not visible.
-
-RULES
-- Any server refusal, abort or busy reply ends the episode, so keep every request inside the limits.
-- SEARCH: when the target is not visible, the backend takes over and turns the robot itself, in steps of about {getattr(args, 'scan_step_eff', args.scan_step):g} degrees, until it is seen on {args.acquire_frames} frames in a row. While the message says SEARCH MODE you only report target_visible and your offset estimate; your motion requests are ignored (on the frame where the target is first seen the backend holds still to confirm it, and on the confirming frame it runs the alignment action you chose). If target_visible is false for {args.n_lost_max} steps in a row during alignment, the search starts again.
-- Learn what each action did from the previous frame and the history. If a step made things worse, reverse it.
-- SIZING: work out the correction from the calibration (amount = -offset / px-per-unit) and send it in ONE move when it fits inside the step limit. Apply the share of the error stated in LEARNED NOTES (70% if there are no notes). Only when the target is within about {3 * args.tol:g} px of the marker, switch to fine corrections.
-- The playbook's *_SMALL action names are labels, not a size requirement: the size is the amount you pass, up to the limits above. In the real reward the motion penalty is tiny ({args.control_penalty:g} per motion step) and the main term is the progress made per step, so one correct larger move scores better than several timid ones. Cautious tiny steps are only right when you are unsure of the direction or scale.
-- Always answer by calling act(). Keep the observation short."""
+    """Run parameters only. The procedure and rules live in skills.md."""
+    text = f"""RUN PARAMETERS (numbers for this run; the playbook above explains how to use them)
+- image: {w}x{h} px
+- target: a blue rubbish bin with a black marker
+- rotate_robot: minimum {MIN_ROTATE_DEG:g}, at most {caps['rot']:g} degrees per step
+- pan_camera: servo range {caps['pan_min']}-{caps['pan_max']}, at most {caps['pan_step']:g} units per step
+- move_*: at most {caps['move']:g} m per step
+- finish tolerance: {args.tol:g} px, needs {args.k_stable} consecutive confirmations
+- fine-correction zone: within {3 * args.tol:g} px
+- search: backend turns about {getattr(args, 'scan_step_eff', args.scan_step):g} degrees per step; the target must be seen on {args.acquire_frames} frames in a row
+- search restarts after {args.n_lost_max} steps in a row with the target not visible"""
     if not args.no_prior:
-        text += (f"\n- Rough prior: the horizontal field of view is about {hfov:.0f} degrees across the full "
-                 f"image width, i.e. about {w / hfov:.1f} px per degree. Treat it as a starting guess and "
-                 f"refine it from results.")
+        text += (f"\n- Rough prior: horizontal field of view about {hfov:.0f} degrees, i.e. about "
+                 f"{w / hfov:.1f} px per degree; a starting guess, refine it from results")
     if args.grid:
         text += "\n- Vertical white lines are drawn on the image every 80 px, labelled with their x pixel coordinate."
     return text
@@ -729,6 +717,7 @@ def run(args):
     episode_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(args.out) / episode_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    learned_path = run_dir / Path(args.learned).name
     log = open(run_dir / "log.jsonl", "a", buffering=1)
 
     # 1. readiness: /status, /camera_info, gyro, centre the pan servo
@@ -750,7 +739,7 @@ def run(args):
     caps = make_caps(lim, args, L)
     if L is not None:
         learned = L.text = render_notes(L, caps, args, w_eff, hfov)
-        write_notes(args.learned, learned)
+        write_notes(learned_path, learned)
         print("learning: %d past episodes | rotate k=%s conf %.2f | pan k=%s conf %.2f | caps: rotate %g deg, pan %d units"
               % (L.episodes, "n/a" if L.rot.k is None else "%+.1f" % L.rot.k, L.rot.conf,
                  "n/a" if L.pan.k is None else "%+.2f" % L.pan.k, L.pan.conf, caps["rot"], caps["pan_step"]))
@@ -961,9 +950,9 @@ def run(args):
             try:
                 L2 = learn(args.out, args)
                 caps2 = make_caps(lim, args, L2)
-                write_notes(args.learned, render_notes(L2, caps2, args, w_eff, hfov))
+                write_notes(learned_path, render_notes(L2, caps2, args, w_eff, hfov))
                 print("learned notes updated (%s): next run's caps rotate %g deg, pan %d units"
-                      % (args.learned, caps2["rot"], caps2["pan_step"]))
+                      % (learned_path, caps2["rot"], caps2["pan_step"]))
             except Exception as e:
                 print("warning: could not update learned notes:", e)
 

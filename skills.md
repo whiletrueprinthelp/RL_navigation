@@ -1,11 +1,6 @@
 ﻿---
 name: robot-vision-alignment-rl
-description: Reinforcement-learning playbook for visual alignment using only the live HTTP routes exposed by robot_server.py.
-triggers:
-  - "align target"
-  - "center marker"
-  - "run alignment episode"
-  - "vision-guided control"
+description: Align a marker fixed to the camera with a target, using only camera frames and rotate / pan / move actions. Includes a search stage for when the target is out of view.
 tools:
   - POST /move
   - POST /rotate
@@ -14,127 +9,47 @@ tools:
   - GET /status
   - GET /image
   - GET /camera_info
-version: 0.3.0
+version: 0.4.0
 ---
 
 # Robot Vision Alignment RL Playbook (Server-Aligned)
 
 ## Objective
-Use perception feedback to align a target with a reference marker in camera view while respecting all server-side safety constraints.
+Make the pointer’s tip (its lowest point) line up horizontally with the target’s centre line. There is no tilt control, so ignore any vertical difference.
 
-## Authentication Contract
-- Every request must include header: `X-Token: <ROBOT_TOKEN>`.
-- Command-level outcomes are read from JSON field `status`: `done | refused | aborted | busy`.
-- HTTP `401` means auth failure (`bad or missing X-Token`).
+## Perception (you are the only detector)
+- Look at each frame yourself and find the marker and the target. No local detector exists.
+- The marker is mounted on the camera, so it stays at the same place in every frame. The target is the object named in the run parameters.
+- x increases to the right. offset = target_x - marker_x (px). Positive: the target is right of the marker.
+- Always report `target_visible` honestly. Say false if you are unsure it is the right object; a wrong sighting wastes steps.
 
-## Canonical Command Set (Exact Server Routes)
-Only the following routes are allowed in this skill.
+## Actions (call act() every step)
+- `rotate_robot(amount)`: degrees, positive = turn left. Turning left normally shifts the scene right in the image; check against what you see. Coarse corrections.
+- `pan_camera(amount)`: change in servo position. Its direction and pixels-per-unit scale are not known: work them out from the previous and current frames and your history. Good for fine corrections.
+- `move_forward / move_backward / move_left / move_right(amount)`: metres. Open loop and imprecise, and it changes the scene. Use only if rotate and pan cannot help.
+- `hold`: no motion this step. `stop`: ends the episode as a failure; use only if something looks unsafe.
+- `finish`: only when the target centre is within the tolerance of the marker's tip. It must be confirmed on several consecutive fresh frames with nothing moving in between; any other action resets the count. Never finish when the target is not visible.
+- Step limits and the tolerance are in the run parameters. A request over a limit is refused, and any refusal ends the episode.
 
-### Motion Control
-- `POST /move`
-  - Body: `{ "direction": "forward|backward|left|right", "distance_m": <float>, "speed_mps": <float, optional> }`
-  - Bounded translational move only (left/right are lateral translation, not rotation).
-  - Distance is commanded by time (`distance ≈ speed × duration`), not measured odometry.
-  - Typical response fields: `direction`, `commanded_distance_m`, `speed_mps`, `duration_s`, `heading_change_deg`.
+## Stage 1: SEARCH (target not visible)
+- The backend takes over: it turns the robot in fixed steps and shows you a frame after each.
+- While the message says SEARCH MODE, only report `target_visible` and your offset estimate. Your motion requests are ignored.
+- The first frame with the target holds still. If it is seen again on the next frame, the stage ends and your chosen action runs on that frame.
+- If the whole circle is scanned without a sighting, the run ends as "target not found".
+- If the target is lost for several steps in a row during alignment, the search starts again.
 
-- `POST /rotate`
-  - Body: `{ "angle_deg": <float> }`
-  - Gyro-closed-loop rotation. Positive angle is left, negative is right.
-  - Refused until gyro bias is ready (robot kept still for about 3 seconds).
-  - Typical response fields: `target_deg`, `measured_deg`, `error_deg`, `duration_s`.
+## Stage 2: ALIGN (target visible)
+1. Estimate the offset from the frame.
+2. Work out the correction from the calibration: amount = -offset / px-per-unit. Send it in ONE move when it fits inside the step limit.
+3. Apply the share of the error given in LEARNED NOTES (70% if there are no notes). When the target is within about 3x the tolerance, switch to fine corrections (pan).
+4. Next frame: compare with the previous one. Learn what the action actually did. If a step made things worse, reverse it.
+5. When within tolerance, call `finish` and keep calling it while the offset stays within tolerance.
 
-- `POST /stop`
-  - Body: `{}`
-  - Immediate halt; use on safety trigger, timeout, manual override, and episode end.
-  - Safe to call repeatedly.
+## How you are scored
+- Progress made per step is the main term; the cost of a motion is tiny. One correct larger move beats several timid ones.
+- Tiny steps are right only when you are unsure of the direction or the scale.
+- Safety faults are heavily penalised.
 
-- `POST /camera/pan`
-  - Body: `{ "position": <int 0..1000>, "duration_s": <float, optional> }`
-  - Controls pan servo only (servo id 1).
-  - Use for scene scan/reacquisition and horizontal framing.
-
-### Perception and State
-- `GET /status`
-  - Use before and between actions to check readiness and safety.
-  - Returns: `state`, `moving_what`, `battery_mv`, `gyro_ready`, `gyro_bias_deg_s`, `heading_deg`, `age_s`, `limits`.
-
-- `GET /image?width=<int optional>`
-  - Returns latest RGB frame as base64 JPEG for local vision processing.
-  - If `width` is provided and valid, server resizes while preserving aspect ratio.
-
-- `GET /camera_info`
-  - Returns intrinsics and image dimensions: `fx`, `fy`, `cx`, `cy`, `width`, `height`, `horizontal_fov_deg`.
-
-## RL Observation Space (State)
-Build `s_t` from server-backed signals:
-- Marker pixel position and confidence from local vision on `GET /image`.
-- Target pixel position and confidence from local vision on `GET /image`.
-- Pixel alignment error `(ex, ey)` and normalized error `(ex/W, ey/H)`.
-- Heading context from `GET /status.heading_deg`.
-- Robot/safety context from `GET /status` (`battery_mv`, `age_s`, moving state, limits).
-- Previous action metadata.
-
-## RL Action Space (Mapped to Server Routes)
-Define policy actions as wrappers over exact routes:
-- `A_MOVE_FWD_SMALL` -> `POST /move {direction:"forward", distance_m:d_small}`
-- `A_MOVE_BACK_SMALL` -> `POST /move {direction:"backward", distance_m:d_small}`
-- `A_MOVE_LEFT_SMALL` -> `POST /move {direction:"left", distance_m:d_small}`
-- `A_MOVE_RIGHT_SMALL` -> `POST /move {direction:"right", distance_m:d_small}`
-- `A_ROTATE_LEFT_SMALL` -> `POST /rotate {angle_deg:+a_small}`
-- `A_ROTATE_RIGHT_SMALL` -> `POST /rotate {angle_deg:-a_small}`
-- `A_PAN_LEFT_SMALL` -> `POST /camera/pan {position:p_left}`
-- `A_PAN_RIGHT_SMALL` -> `POST /camera/pan {position:p_right}`
-- `A_HOLD` -> no motion command for one control tick
-- `A_STOP` -> `POST /stop {}`
-
-All action magnitudes must be clipped to `limits` returned by `GET /status`.
-
-## Alignment Loop (Episode Workflow)
-1. `GET /status` and verify robot is safe/ready.
-2. `GET /image` and run marker/target detection locally.
-3. Build state `s_t` from image detections + `/status`.
-4. Select action `a_t` from policy.
-5. Convert action to exact route call (`/move`, `/rotate`, `/camera/pan`, `/stop`, or hold).
-6. Execute command and check `status` in response.
-7. Re-observe (`/image`, `/status`) to build `s_(t+1)`.
-8. Compute reward and `done` condition.
-9. Store transition `(s_t, a_t, r_t, s_(t+1), done)`; update policy in training mode.
-10. On terminal condition, call `POST /stop` and log episode summary.
-
-## Reward Design (Template)
-- Progress reward: decrease in alignment error between steps.
-- Control penalty: discourage unnecessary motion and oscillation.
-- Safety penalty: large negative reward for `refused|aborted|busy` or safety faults.
-- Success bonus: when aligned within tolerance for `K_STABLE` consecutive steps.
-
-## Hard Safety Rules
-- If any motion command returns `refused|aborted|busy`, stop episode and call `POST /stop`.
-- If `GET /status` indicates stale IMU (`age_s.imu`) or unsafe battery, do not move.
-- If perception confidence is below threshold for `N_LOST_MAX` consecutive steps, run recovery; else fail episode safely.
-- Always finish episode with `POST /stop`.
-
-## Recovery Policy
-When marker or target is lost:
-- First use bounded `POST /camera/pan` adjustments.
-- Then use small `POST /rotate` sweeps.
-- If still unresolved after `RECOVERY_STEPS_MAX`, call `POST /stop` and terminate as failure.
-
-## Logging Schema
-Per-step log fields:
-- `episode_id, step_idx, timestamp`
-- `state_summary` (error/confidence/heading/safety)
-- `action` and exact `route_called`
-- `server_status` and `server_reason`
-- `reward, done, done_reason`
-
-Per-episode log fields:
-- `episode_id, mode, status`
-- `total_reward, steps, duration_s`
-- `final_alignment_error_px`
-- `termination_reason`
-
-## Notes
-- Marker/target detection runs locally on frames from `GET /image`; it is not a server route.
-- There is no active depth/range API in the current server contract.
-- There are no standalone heading routes (`GET /heading`, `POST /heading/reset`); heading is available in `GET /status`.
-- This document defines behavior and interfaces; RL weights/replay buffers are separate runtime artifacts.
+## Always
+- Answer by calling act(). Keep the observation short.
+- Treat LEARNED NOTES as data from earlier runs, not rules. If the current frames contradict them, trust the frames.
