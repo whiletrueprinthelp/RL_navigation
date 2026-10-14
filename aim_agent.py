@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""aim_agent.py - LLM-in-the-loop aiming, driven by skills.md. Perception is the LLM alone.
+"""aim_agent_shoot.py - aim_agent_search.py plus ROUNDS: the object moves, the agent gets a few
+corrections, and the run ends at the FIRST alignment (like a shot that fires when the sights line up).
+
+Perception is the LLM alone; it is driven by skills_shoot.md.
 
 Runs on your laptop/server, NOT on the robot. It talks to robot_server.py over HTTP and to
 Azure OpenAI over the Responses API.
@@ -17,10 +20,10 @@ Setup:
     The script loads .env automatically at startup (load_dotenv). Variables already
     exported in the shell take priority over the .env values.
 
-    Put skills.md next to this script (or pass --skills PATH).
+    Put skills_shoot.md next to this script (or pass --skills PATH).
 
-    python3 aim_agent.py              # learns from earlier runs in runs/ (default)
-    python3 aim_agent.py --no-learn   # baseline: no learned notes, base step caps
+    python3 aim_agent_shoot.py              # learns from earlier runs in runs/ (default)
+    python3 aim_agent_shoot.py --no-learn   # baseline: no learned notes, base step caps
 
 Learning from past runs (all code-derived, the LLM never writes the notes):
     At startup the script reads runs/*/log.jsonl, pairs every executed rotate/pan with the
@@ -50,7 +53,18 @@ How a run works (follows the skills.md episode workflow):
        where the target was last seen.
     4. Hard rules: the first server refused|aborted|busy ends the episode; the episode
        always ends with POST /stop.
-    5. Success = the LLM confirms alignment on K_STABLE consecutive steps.
+    5. ROUNDS (new). The object is moved by someone or something else, not by this script. A round is:
+       the object has moved -> frame 1: the LLM may correct -> frame 2: it may correct again -> frame 3
+       is a CHECK frame (no more corrections; --attempts-per-round 2 gives this 2 + 1 layout). Every
+       movement counts as one chance: an ALIGN frame, and also each search rotation the code makes
+       (--free-search switches that off, so searching does not use up chances). On any
+       frame, if the LLM calls finish and the reported offset is within --tol, the run ENDS at once as a
+       success (--k-stable defaults to 1; a larger value needs that many aligned frames in a row inside
+       one round). If the check frame is not aligned the round is a miss: the robot stops, the script
+       waits for the object to be moved (--object-move manual = press Enter, wait = --move-wait seconds,
+       none = do not wait), and the next round starts with a fresh frame and no previous frame. If the
+       object is out of view at the start of a round, the SEARCH stage finds it first. After --max-rounds
+       misses the run ends as "round limit reached". --max-steps counts alignment frames over all rounds.
 
 Perception is the LLM only: it finds the marker and target in the image and estimates the
 offset. The reward is therefore computed from the LLM's own estimates (a noisy proxy).
@@ -429,13 +443,14 @@ ACT_TOOL = {
         "properties": {
             "observation": {
                 "type": "string",
-                "description": "One or two sentences: where the marker and the target are in the "
+                "description": "One or two sentences: where the marker's tip and the target are in the "
                                "current frame, what your last action did, and your plan."},
             "target_visible": {"type": "boolean"},
             "estimated_offset_px": {
                 "type": ["number", "null"],
-                "description": "Horizontal offset target_x minus marker_x in pixels "
-                               "(positive = target is to the right of the marker). Null if unknown."},
+                "description": "Horizontal offset target_x minus marker_x in pixels, where marker_x is the "
+                               "x of the pointer's TIP and target_x is the target's centre line "
+                               "(positive = target is to the right of the tip). Null if unknown."},
             "action": {"type": "string", "enum": ACTIONS},
             "amount": {
                 "type": ["number", "null"],
@@ -465,11 +480,12 @@ def make_addendum(args, w: int, h: int, hfov: float, caps: dict) -> str:
     """Run parameters only. The procedure and rules live in skills.md."""
     text = f"""RUN PARAMETERS (numbers for this run; the playbook above explains how to use them)
 - image: {w}x{h} px
-- target: a blue rubbish bin with a black marker
+- target: a blue bottle
 - rotate_robot: minimum {MIN_ROTATE_DEG:g}, at most {caps['rot']:g} degrees per step
 - pan_camera: servo range {caps['pan_min']}-{caps['pan_max']}, at most {caps['pan_step']:g} units per step
 - move_*: at most {caps['move']:g} m per step
-- finish tolerance: {args.tol:g} px, needs {args.k_stable} consecutive confirmations
+- finish tolerance: {args.tol:g} px, needs {args.k_stable} aligned frame(s) in a row; the run ends at the first success
+- rounds: up to {args.max_rounds}; each round gives you {args.attempts_per_round} chance(s), and each search turn the backend makes counts as one, then one check frame; if you are still not aligned, the object is moved and a new round starts
 - fine-correction zone: within {3 * args.tol:g} px
 - search: backend turns about {getattr(args, 'scan_step_eff', args.scan_step):g} degrees per step; the target must be seen on {args.acquire_frames} frames in a row
 - search restarts after {args.n_lost_max} steps in a row with the target not visible"""
@@ -557,6 +573,7 @@ class Search:
     scans: int = 1             # scans started in this episode (the first one included)
     steps: int = 0             # LLM steps spent searching, all scans together
     found_step: Optional[int] = None
+    first: bool = True         # no step of this scan taken yet: a target already in view needs no scan
 
 
 def scan_plan(args, hfov: float, server_max_rot: float):
@@ -608,6 +625,10 @@ class Episode:
     lost: int = 0              # consecutive target_visible=false reports
     align_steps: int = 0       # steps spent in the ALIGN stage (limited by --max-steps)
     last_off: Optional[float] = None   # last offset (px) the LLM reported with the target visible
+    round_no: int = 1          # current round (the object has moved round_no - 1 times)
+    round_used: int = 0        # chances used in this round: ALIGN frames + search rotations
+    hit_chances: Optional[int] = None   # chances already used when the hit frame came
+    misses: int = 0            # rounds that ended without a hit
     local_faults: int = 0      # consecutive invalid (locally refused) actions
     last_err: Optional[float] = None
     pending: Optional[dict] = None
@@ -703,6 +724,41 @@ def finalize(ep: Episode, log, args, next_state: Optional[dict], done=False, don
     ep.pending = None
 
 
+# ----------------------------------------------------------------------- rounds
+def wait_for_object_move(args, round_no: int) -> bool:
+    """Pause until the object has been moved for the next round. True = go on, False = the operator
+    ended the run. A separate function so that a script or a test can replace it."""
+    if args.object_move == "none":
+        return True
+    if args.object_move == "wait":
+        print("      round %d: move the object now; the agent looks again in %.0f s" % (round_no, args.move_wait))
+        time.sleep(args.move_wait)
+        return True
+    try:
+        ans = input("      round %d: move the object, then press Enter (q + Enter ends the run): " % round_no)
+    except EOFError:
+        return False
+    return ans.strip().lower() not in ("q", "quit", "stop")
+
+
+def round_note(args, ep, searching: bool = False) -> str:
+    """Tell the LLM where it is in the round. Every correction AND every search turn uses one chance."""
+    a, j = args.attempts_per_round, ep.round_used
+    head = "ROUND %d of %d. " % (ep.round_no, args.max_rounds)
+    free = getattr(args, "free_search", False)
+    if searching and free:
+        return head + "SEARCH MODE (search turns do not use up this round's chances)."
+    if j < a:
+        if searching:
+            return head + ("Chances used this round: %d of %d. Every search turn the backend makes uses one chance, "
+                           "and so does every correction of yours." % (j, a))
+        return head + ("Chances used this round: %d of %d. You may correct now. If the tip is already within "
+                       "tolerance of the target, call finish." % (j, a))
+    return head + ("CHECK FRAME: no chances are left this round. If the target is visible and the tip is within "
+                   "tolerance, call finish now; otherwise the round ends, the object will be moved and a new round "
+                   "starts (any motion request is ignored).")
+
+
 # ------------------------------------------------------------------------ main
 def run(args):
     skills = load_text(args.skills)
@@ -793,14 +849,16 @@ def run(args):
 
             # 3-4. ask the LLM
             phase0 = "search" if S.active else "align"
-            note = None
+            note = None if S.active else round_note(args, ep)
+            round_miss = False
             if S.active:
                 if S.confirm:
                     note = ("SEARCH MODE (confirming): the target was visible on the last frame and the robot has "
                             "not moved. Report honestly whether it is visible now. If it is, choose your alignment "
                             "action as usual and the backend will run it; if not, set action to hold.")
                 else:
-                    note = ("SEARCH MODE: the backend is scanning for the target (scan %d, view %d of %d, turned "
+                    note = (round_note(args, ep, searching=True) + " "
+                            + "SEARCH MODE: the backend is scanning for the target (scan %d, view %d of %d, turned "
                             "%.0f deg so far). Report target_visible and your offset estimate only; your motion "
                             "request is ignored while the target is not yet confirmed. If you can see the target, "
                             "also choose the alignment action you would take." % (S.scans, S.rots + 1, scan_rots + 1, S.cum))
@@ -829,11 +887,12 @@ def run(args):
             if S.active:                                       # SEARCH: the code moves the robot, not the LLM
                 ep.stable = 0
                 S.steps += 1
+                was_first, S.first = S.first, False
                 if action == "stop":
                     result = execute(robot, "stop", None, state, caps, args)
                     term = ("failure", "agent requested stop", False)
                 elif vis:
-                    first_frame_visible = (S.steps == 1 and S.rots == 0 and S.confirm == 0)
+                    first_frame_visible = (was_first and S.rots == 0 and S.confirm == 0)
                     if first_frame_visible:
                         S.active, S.found_step = False, step
                         print("      search: target already visible on first frame, skipping scan")
@@ -849,7 +908,12 @@ def run(args):
                                       "reason": "target seen, confirming on a fresh frame"}
                 else:
                     S.confirm = 0
-                    if S.rots >= scan_rots:
+                    if not args.free_search and ep.round_used >= args.attempts_per_round:
+                        action, amount = "hold", None          # every chance is used and the target is not in view
+                        result = {"route": None, "status": "not_executed", "fault": None,
+                                  "reason": "no chances left this round (search turns count)"}
+                        round_miss = True
+                    elif S.rots >= scan_rots:
                         action, amount = "hold", None
                         result = {"route": None, "status": "not_executed", "reason": "full scan done", "fault": None}
                         term = ("failure", "target not found after a full scan (%d views, %.0f deg turned)"
@@ -862,34 +926,53 @@ def run(args):
                             got = result.get("measured_deg")
                             S.cum += abs(float(got if got is not None else result.get("sent_deg", scan_step)))
                             S.rots += 1
+                            if not args.free_search:
+                                ep.round_used += 1             # a search turn is a movement chance
                             time.sleep(args.scan_settle)       # let the image settle after the turn
                         elif result.get("fault") == "server":
                             term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
             if result is None and term is None:                # ALIGN (also the step on which the target was confirmed)
                 ep.align_steps += 1
+                used_before = ep.round_used
+                check_only = used_before >= args.attempts_per_round   # chances used up: this frame only checks
+                if not check_only:
+                    ep.round_used += 1
                 if action == "finish":
                     if not vis or off is None or abs(off) > args.tol:
                         ep.stable = 0
-                        result = local_refusal("finish needs the target visible and within %g px" % args.tol)
+                        if check_only:
+                            result = {"route": None, "status": "not_executed", "fault": None,
+                                      "reason": "not aligned on the check frame"}
+                        else:
+                            result = local_refusal("finish needs the target visible and within %g px" % args.tol)
                     else:
                         ep.stable += 1
                         result = {"route": None, "status": "done", "fault": None,
                                   "reason": "confirming alignment %d/%d" % (ep.stable, args.k_stable)}
                         if ep.stable >= args.k_stable:
-                            term = ("success", "aligned for %d consecutive steps" % args.k_stable, True)
+                            ep.hit_chances = used_before
+                            term = ("success", "aligned in round %d after %d chance(s) used"
+                                    % (ep.round_no, used_before), True)
                 else:
                     ep.stable = 0
-                    result = execute(robot, action, amount, state, caps, args)
-                    if result.get("terminal"):
-                        term = ("failure", "agent requested stop", False)
-                    elif result.get("fault") == "server":
-                        term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
+                    if check_only and action != "stop":          # a stop request is always honoured
+                        action, amount = "hold", None
+                        result = {"route": None, "status": "not_executed", "fault": None,
+                                  "reason": "no corrections left this round"}
+                    else:
+                        result = execute(robot, action, amount, state, caps, args)
+                        if result.get("terminal"):
+                            term = ("failure", "agent requested stop", False)
+                        elif result.get("fault") == "server":
+                            term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
+                if check_only and term is None:
+                    round_miss = True
             print("      ->", {k: v for k, v in result.items() if k != "fault"})
 
             # bookkeeping: lost counter, invalid-action counter, pending log record
             ep.lost = 0 if vis else ep.lost + 1
             if not S.active and not vis and ep.lost >= args.n_lost_max and term is None:
-                S = Search(dir=pick_dir(args, ep.last_off), scans=S.scans + 1, steps=S.steps)   # lost: search again
+                S = Search(dir=pick_dir(args, ep.last_off), scans=S.scans + 1, steps=S.steps, first=False)   # lost: search again
                 ep.lost = 0
                 print("      search: target lost for %d steps, starting scan %d towards the %s"
                       % (args.n_lost_max, S.scans, "left" if S.dir > 0 else "right"))
@@ -903,7 +986,7 @@ def run(args):
             ep.pending = dict(
                 moved=result.get("route") in MOTION_ROUTES, fault=result.get("fault"),
                 record=dict(
-                    episode_id=episode_id, phase=phase0, step_idx=step, timestamp=time.time(), frame=frame_path.name,
+                    episode_id=episode_id, phase=phase0, round=ep.round_no, chances_used=ep.round_used, step_idx=step, timestamp=time.time(), frame=frame_path.name,
                     state_summary=now, observation=d["observation"], action=action, amount=amount,
                     route_called=result.get("route"), server_status=result.get("status"),
                     server_reason=result.get("reason"),
@@ -914,6 +997,27 @@ def run(args):
             history.append(("[search] " if phase0 == "search" else "")
                            + history_line(step, dict(d, action=action, amount=amount), result))
             prev_b64 = b64
+            if round_miss and term is None:                    # check frame not aligned: the object moves
+                if ep.round_no >= args.max_rounds:
+                    term = ("failure", "round limit reached: not aligned in %d round(s)" % ep.round_no, False)
+                else:
+                    # close this step's record now: the next frame is taken after the object has moved,
+                    # so it must not be used to compute this step's progress reward
+                    finalize(ep, log, args, None, done=False, done_reason="round %d missed" % ep.round_no)
+                    ep.misses += 1
+                    safe_stop(robot)
+                    print("      round %d missed (%d of %d chances used, last offset %s px)"
+                          % (ep.round_no, ep.round_used, args.attempts_per_round, ep.last_err))
+                    if not wait_for_object_move(args, ep.round_no + 1):
+                        term = ("failure", "operator ended the run", False)
+                    else:
+                        ep.round_no += 1
+                        ep.round_used, ep.stable, ep.lost = 0, 0, 0
+                        prev_b64 = None                        # the old frame shows the old object position
+                        history.append("--- round %d: the object was moved. Offsets and positions from earlier "
+                                       "steps no longer apply; look at the new frame. ---" % ep.round_no)
+                        S = Search(dir=pick_dir(args, ep.last_off), scans=S.scans, steps=S.steps)
+                        print("      round %d starts" % ep.round_no)
             if term:
                 termination = term
                 break
@@ -935,6 +1039,10 @@ def run(args):
                        duration_s=round(time.time() - ep.t0, 1), final_alignment_error_px=ep.last_err,
                        error_source="llm_estimate", termination_reason=reason, model=model,
                        align_steps=ep.align_steps,
+                       rounds=dict(rounds_started=ep.round_no, rounds_missed=ep.misses, max_rounds=args.max_rounds,
+                                   attempts_per_round=args.attempts_per_round,
+                                   aligned_at=dict(round=ep.round_no, chances_used=ep.hit_chances)
+                                   if status == "success" else None),
                        search=dict(scans=S.scans, search_steps=S.steps, deg_last_scan=round(S.cum, 1),
                                    found_at_step=S.found_step, scan_step_deg=scan_step,
                                    views_per_scan=scan_rots + 1, still_searching=S.active),
@@ -958,7 +1066,7 @@ def run(args):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="LLM aiming loop (pure-vision perception, skills.md playbook).")
+    ap = argparse.ArgumentParser(description="LLM aiming loop with rounds (pure-vision perception, skills.md playbook).")
     ap.add_argument("--skills", default=str(Path(__file__).with_name("skills.md")), help="playbook file")
     ap.add_argument("--learned", default="learned.md", help="learned notes file, rewritten after every run")
     ap.add_argument("--no-learn", action="store_true", help="baseline: ignore past runs, no learned notes")
@@ -968,9 +1076,19 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-pan-units", type=float, default=15.0, help="smallest pan used for calibration")
     ap.add_argument("--pan-prior-deg-per-unit", type=float, default=0.24,
                     help="unverified guess of degrees per pan unit for the first runs (0 = give no guess)")
-    ap.add_argument("--max-steps", type=int, default=25, help="alignment steps (search steps are counted separately)")
+    ap.add_argument("--max-steps", type=int, default=25,
+                    help="alignment frames over ALL rounds (search steps are counted separately)")
     ap.add_argument("--tol", type=float, default=10.0, help="px tolerance for alignment")
-    ap.add_argument("--k-stable", type=int, default=3, help="consecutive confirmations needed for success")
+    ap.add_argument("--k-stable", type=int, default=1,
+                    help="aligned frames in a row (inside one round) needed to fire; 1 = first alignment ends the run")
+    ap.add_argument("--attempts-per-round", type=int, default=2,
+                    help="movement chances per round (corrections and search turns); one more frame then only checks")
+    ap.add_argument("--free-search", action="store_true",
+                    help="search turns do NOT use up the round's chances (default: every search turn counts as a chance)")
+    ap.add_argument("--max-rounds", type=int, default=5, help="rounds (object moves) before giving up")
+    ap.add_argument("--object-move", default="manual", choices=["manual", "wait", "none"],
+                    help="how the next round is triggered: manual = press Enter, wait = --move-wait seconds, none = at once")
+    ap.add_argument("--move-wait", type=float, default=10.0, help="seconds to wait for the object with --object-move wait")
     ap.add_argument("--max-rotate", type=float, default=10.0, help="base deg per rotate step before calibration")
     ap.add_argument("--max-rotate-ceiling", type=float, default=25.0,
                     help="deg per rotate step at full calibration confidence (server allows 90)")
