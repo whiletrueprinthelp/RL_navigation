@@ -3,6 +3,7 @@
 .env
 /__pycache__
 /runs
+/runs_track
 /own_docs/
 /old
 

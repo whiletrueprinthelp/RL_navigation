@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""aim_agent_shoot.py - aim_agent_search.py plus ROUNDS: the object moves, the agent gets a few
-corrections, and the run ends at the FIRST alignment (like a shot that fires when the sights line up).
+"""aim_agent.py - pure-vision alignment agent with two run modes: shoot (round-based first-hit) and track (continuous follow).
 
-Perception is the LLM alone; it is driven by skills_shoot.md.
+Perception is the LLM alone; it is driven by skills.md.
 
 Runs on your laptop/server, NOT on the robot. It talks to robot_server.py over HTTP and to
 Azure OpenAI over the Responses API.
@@ -20,10 +19,10 @@ Setup:
     The script loads .env automatically at startup (load_dotenv). Variables already
     exported in the shell take priority over the .env values.
 
-    Put skills_shoot.md next to this script (or pass --skills PATH).
+    Put skills.md next to this script (or pass --skills PATH).
 
-    python3 aim_agent_shoot.py              # learns from earlier runs in runs/ (default)
-    python3 aim_agent_shoot.py --no-learn   # baseline: no learned notes, base step caps
+    python3 aim_agent.py --run-mode shoot              # round-based first-hit mode
+    python3 aim_agent.py --run-mode track --no-learn   # continuous follow baseline
 
 Learning from past runs (all code-derived, the LLM never writes the notes):
     At startup the script reads runs/*/log.jsonl, pairs every executed rotate/pan with the
@@ -53,24 +52,16 @@ How a run works (follows the skills.md episode workflow):
        where the target was last seen.
     4. Hard rules: the first server refused|aborted|busy ends the episode; the episode
        always ends with POST /stop.
-    5. ROUNDS (new). The object is moved by someone or something else, not by this script. A round is:
-       the object has moved -> frame 1: the LLM may correct -> frame 2: it may correct again -> frame 3
-       is a CHECK frame (no more corrections; --attempts-per-round 2 gives this 2 + 1 layout). Every
-       movement counts as one chance: an ALIGN frame, and also each search rotation the code makes
-       (--free-search switches that off, so searching does not use up chances). On any
-       frame, if the LLM calls finish and the reported offset is within --tol, the run ENDS at once as a
-       success (--k-stable defaults to 1; a larger value needs that many aligned frames in a row inside
-       one round). If the check frame is not aligned the round is a miss: the robot stops, the script
-       waits for the object to be moved (--object-move manual = press Enter, wait = --move-wait seconds,
-       none = do not wait), and the next round starts with a fresh frame and no previous frame. If the
-       object is out of view at the start of a round, the SEARCH stage finds it first. After --max-rounds
-       misses the run ends as "round limit reached". --max-steps counts alignment frames over all rounds.
+    5. MODE-SPECIFIC FLOW:
+       - shoot mode: round-based workflow. The object is moved externally between rounds; each round has
+         limited chances (--attempts-per-round) then a check frame. finish while aligned ends the run.
+       - track mode: continuous workflow with no round/check-frame gating. The loop runs until
+         --track-seconds, --max-steps, a stop request, or a terminal fault. finish is treated as
+         "aligned now, hold" unless --end-on-aligned is set.
 
-Perception is the LLM only: it finds the marker and target in the image and estimates the
-offset. The reward is therefore computed from the LLM's own estimates (a noisy proxy).
+Perception is the LLM only: it finds the marker and target in the image and estimates the offset. The reward is therefore computed from the LLM's own estimates (a noisy proxy).
 
-Output in runs/<episode_id>/:  step_NNN.jpg frames, log.jsonl (one record per step, with
-reward, done, done_reason and next_state), episode_summary.json.
+Output in runs/<episode_id>/:  step_NNN.jpg frames, log.jsonl (one record per step, with reward, done, done_reason and next_state), episode_summary.json.
 """
 from __future__ import annotations
 
@@ -248,7 +239,7 @@ class Learned:
     text: str = ""
 
 
-def read_runs(out_dir, window: int, exclude: Optional[str] = None):
+def read_runs(out_dir, window: int, exclude: Optional[str] = None, run_mode: Optional[str] = None):
     """[(episode_id, log rows, summary or None)] for the newest `window` episodes."""
     dirs = sorted(d for d in Path(out_dir).glob("*") if (d / "log.jsonl").exists() and d.name != exclude)
     runs = []
@@ -266,6 +257,12 @@ def read_runs(out_dir, window: int, exclude: Optional[str] = None):
             summ = json.loads((d / "episode_summary.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             summ = None
+        if run_mode:
+            summ_mode = (summ or {}).get("run_mode")
+            row_mode = rows[0].get("run_mode") if rows and isinstance(rows[0], dict) else None
+            actual_mode = summ_mode or row_mode or "shoot"
+            if actual_mode != run_mode:
+                continue
         runs.append((d.name, rows, summ))
     return runs
 
@@ -327,9 +324,9 @@ def fit_slope(samples, min_amt: float, min_n: int) -> Calib:
     return c
 
 
-def learn(out_dir, args, exclude: Optional[str] = None) -> Learned:
+def learn(out_dir, args, exclude: Optional[str] = None, run_mode: Optional[str] = "shoot") -> Learned:
     L, rot_s, pan_s, trans, ok_steps = Learned(), [], [], [], []
-    for _, rows, summ in read_runs(out_dir, args.learn_window, exclude):
+    for _, rows, summ in read_runs(out_dir, args.learn_window, exclude, run_mode=run_mode):
         tr = transitions(rows)
         trans += tr
         for kind, a, d, _, _ in tr:
@@ -479,16 +476,27 @@ def load_text(path, strip_frontmatter: bool = True) -> Optional[str]:
 def make_addendum(args, w: int, h: int, hfov: float, caps: dict) -> str:
     """Run parameters only. The procedure and rules live in skills.md."""
     text = f"""RUN PARAMETERS (numbers for this run; the playbook above explains how to use them)
+- run mode: {args.run_mode}
 - image: {w}x{h} px
 - target: a blue bottle
 - rotate_robot: minimum {MIN_ROTATE_DEG:g}, at most {caps['rot']:g} degrees per step
 - pan_camera: servo range {caps['pan_min']}-{caps['pan_max']}, at most {caps['pan_step']:g} units per step
 - move_*: at most {caps['move']:g} m per step
-- finish tolerance: {args.tol:g} px, needs {args.k_stable} aligned frame(s) in a row; the run ends at the first success
-- rounds: up to {args.max_rounds}; each round gives you {args.attempts_per_round} chance(s), and each search turn the backend makes counts as one, then one check frame; if you are still not aligned, the object is moved and a new round starts
+- finish tolerance: {args.tol:g} px, needs {args.k_stable} aligned frame(s) in a row
 - fine-correction zone: within {3 * args.tol:g} px
 - search: backend turns about {getattr(args, 'scan_step_eff', args.scan_step):g} degrees per step; the target must be seen on {args.acquire_frames} frames in a row
 - search restarts after {args.n_lost_max} steps in a row with the target not visible"""
+    if args.run_mode == "shoot":
+        text += (f"\n- rounds: up to {args.max_rounds}; each round gives you {args.attempts_per_round} chance(s), "
+                 "and each search turn the backend makes counts as one, then one check frame; if you are still "
+                 "not aligned, the object is moved and a new round starts"
+                 "\n- success: call finish while aligned; the run ends at the first success")
+    else:
+        text += (f"\n- tracking: continuous run, no rounds or check frame"
+                 f"\n- run ends when {args.track_seconds:g} s elapse, max steps are reached, search budget is exhausted, "
+                 "or you call stop"
+                 "\n- finish in track mode means 'aligned, hold still' (does not end the run unless --end-on-aligned is set)"
+                 f"\n- min interval between steps: {args.min_interval:g} s")
     if not args.no_prior:
         text += (f"\n- Rough prior: horizontal field of view about {hfov:.0f} degrees, i.e. about "
                  f"{w / hfov:.1f} px per degree; a starting guess, refine it from results")
@@ -631,6 +639,12 @@ class Episode:
     misses: int = 0            # rounds that ended without a hit
     local_faults: int = 0      # consecutive invalid (locally refused) actions
     last_err: Optional[float] = None
+    track_frames: int = 0
+    aligned_frames: int = 0
+    longest_stable: int = 0
+    chatter_while_aligned: int = 0
+    guard_would_hold: int = 0
+    search_starts: int = 1
     pending: Optional[dict] = None
     t0: float = field(default_factory=time.time)
 
@@ -711,7 +725,10 @@ def finalize(ep: Episode, log, args, next_state: Optional[dict], done=False, don
     if next_state is not None:
         a, b = cur.get("abs_err_px"), next_state.get("abs_err_px")
         if a is not None and b is not None:
-            parts["progress"] = round((a - b) / ep.w * 100.0, 3)    # % of image width gained
+            if args.run_mode == "track":
+                parts["tracking_error"] = -round(b / ep.w * 100.0, 3)
+            else:
+                parts["progress"] = round((a - b) / ep.w * 100.0, 3)    # % of image width gained
         o1, o2 = cur.get("est_offset_px"), next_state.get("est_offset_px")
         if o1 is not None and o2 is not None and o1 * o2 < 0 and min(abs(o1), abs(o2)) > args.tol:
             parts["oscillation"] = -args.oscillation_penalty
@@ -758,6 +775,12 @@ def round_note(args, ep, searching: bool = False) -> str:
                    "tolerance, call finish now; otherwise the round ends, the object will be moved and a new round "
                    "starts (any motion request is ignored).")
 
+def track_note(args, ep, searching: bool = False) -> str:
+    if searching:
+        return "TRACK MODE: target is currently not confirmed; backend is searching."
+    return ("TRACK MODE: continuous tracking (no rounds). If within tolerance, hold and avoid chasing noise. "
+            "If the target drifts one way across frames, use small corrections and slight lead.")
+
 
 # ------------------------------------------------------------------------ main
 def run(args):
@@ -770,8 +793,10 @@ def run(args):
     client = make_client()
     model = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.3-codex")
 
+    run_mode = args.run_mode
+    out_root = Path("runs_track") if (run_mode == "track" and args.out == "runs") else Path(args.out)
     episode_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(args.out) / episode_id
+    run_dir = out_root / episode_id
     run_dir.mkdir(parents=True, exist_ok=True)
     learned_path = run_dir / Path(args.learned).name
     log = open(run_dir / "log.jsonl", "a", buffering=1)
@@ -791,7 +816,7 @@ def run(args):
         hfov, w0, h0 = DEFAULT_HFOV_DEG, 640, 480
     # width of the frames the model will actually see (the server only shrinks, never enlarges)
     w_eff = args.width if args.width and 32 <= args.width < w0 else w0
-    L = None if args.no_learn else learn(args.out, args, exclude=episode_id)   # learn from earlier runs
+    L = None if args.no_learn else learn(out_root, args, exclude=episode_id, run_mode=run_mode)   # learn from earlier runs
     caps = make_caps(lim, args, L)
     if L is not None:
         learned = L.text = render_notes(L, caps, args, w_eff, hfov)
@@ -821,15 +846,28 @@ def run(args):
           % (scan_rots + 1, hfov, scan_step, "left" if S.dir > 0 else "right", scan_rots, scan_rots * scan_step,
              args.acquire_frames))
 
+    run_cfg = vars(args).copy()
+    run_cfg.update(dict(run_mode=run_mode, out_root=str(out_root), episode_id=episode_id))
+    (run_dir / "run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
+
     history: deque = deque(maxlen=args.history)
     prev_b64, termination = None, None
+    loop_max = args.max_steps + args.max_search_steps if run_mode == "shoot" else args.max_steps
+    last_step_end = time.time()
     try:
-        for step in range(1, args.max_steps + args.max_search_steps + 1):
+        for step in range(1, loop_max + 1):
+            if run_mode == "track" and args.min_interval > 0:
+                wait_s = args.min_interval - (time.time() - last_step_end)
+                if wait_s > 0:
+                    time.sleep(wait_s)
             ep.steps = step
+            if run_mode == "track" and time.time() - ep.t0 >= args.track_seconds:
+                termination = ("done", "track time limit reached", False)
+                break
             if S.active and S.steps >= args.max_search_steps:
                 termination = ("failure", "search budget exhausted: target not found", False)
                 break
-            if not S.active and ep.align_steps >= args.max_steps:
+            if run_mode == "shoot" and (not S.active) and ep.align_steps >= args.max_steps:
                 termination = ("failure", "step limit reached", False)
                 break
 
@@ -840,6 +878,7 @@ def run(args):
                 termination = ("failure", "safety: " + why, False)
                 break
             jpeg, meta = grab_frame(robot, args.width)
+            capture_t = time.time()
             shown = add_grid(jpeg) if args.grid else jpeg
             frame_path = run_dir / f"step_{step:03d}.jpg"
             frame_path.write_bytes(shown)
@@ -849,7 +888,7 @@ def run(args):
 
             # 3-4. ask the LLM
             phase0 = "search" if S.active else "align"
-            note = None if S.active else round_note(args, ep)
+            note = None if S.active else (round_note(args, ep) if run_mode == "shoot" else track_note(args, ep))
             round_miss = False
             if S.active:
                 if S.confirm:
@@ -857,7 +896,7 @@ def run(args):
                             "not moved. Report honestly whether it is visible now. If it is, choose your alignment "
                             "action as usual and the backend will run it; if not, set action to hold.")
                 else:
-                    note = (round_note(args, ep, searching=True) + " "
+                    note = ((round_note(args, ep, searching=True) if run_mode == "shoot" else track_note(args, ep, searching=True)) + " "
                             + "SEARCH MODE: the backend is scanning for the target (scan %d, view %d of %d, turned "
                             "%.0f deg so far). Report target_visible and your offset estimate only; your motion "
                             "request is ignored while the target is not yet confirmed. If you can see the target, "
@@ -908,7 +947,7 @@ def run(args):
                                       "reason": "target seen, confirming on a fresh frame"}
                 else:
                     S.confirm = 0
-                    if not args.free_search and ep.round_used >= args.attempts_per_round:
+                    if run_mode == "shoot" and (not args.free_search) and ep.round_used >= args.attempts_per_round:
                         action, amount = "hold", None          # every chance is used and the target is not in view
                         result = {"route": None, "status": "not_executed", "fault": None,
                                   "reason": "no chances left this round (search turns count)"}
@@ -926,53 +965,89 @@ def run(args):
                             got = result.get("measured_deg")
                             S.cum += abs(float(got if got is not None else result.get("sent_deg", scan_step)))
                             S.rots += 1
-                            if not args.free_search:
+                            if run_mode == "shoot" and (not args.free_search):
                                 ep.round_used += 1             # a search turn is a movement chance
                             time.sleep(args.scan_settle)       # let the image settle after the turn
                         elif result.get("fault") == "server":
                             term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
             if result is None and term is None:                # ALIGN (also the step on which the target was confirmed)
                 ep.align_steps += 1
-                used_before = ep.round_used
-                check_only = used_before >= args.attempts_per_round   # chances used up: this frame only checks
-                if not check_only:
-                    ep.round_used += 1
-                if action == "finish":
-                    if not vis or off is None or abs(off) > args.tol:
-                        ep.stable = 0
-                        if check_only:
-                            result = {"route": None, "status": "not_executed", "fault": None,
-                                      "reason": "not aligned on the check frame"}
-                        else:
-                            result = local_refusal("finish needs the target visible and within %g px" % args.tol)
-                    else:
+                aligned_now = bool(vis and off is not None and abs(off) <= args.tol)
+                guard_would_hold = bool(aligned_now and action in ("rotate_robot", "pan_camera", *MOVE_ACTIONS))
+                if run_mode == "track":
+                    check_only = False
+                    ep.track_frames += 1
+                    if aligned_now:
                         ep.stable += 1
-                        result = {"route": None, "status": "done", "fault": None,
-                                  "reason": "confirming alignment %d/%d" % (ep.stable, args.k_stable)}
-                        if ep.stable >= args.k_stable:
-                            ep.hit_chances = used_before
-                            term = ("success", "aligned in round %d after %d chance(s) used"
-                                    % (ep.round_no, used_before), True)
-                else:
-                    ep.stable = 0
-                    if check_only and action != "stop":          # a stop request is always honoured
-                        action, amount = "hold", None
-                        result = {"route": None, "status": "not_executed", "fault": None,
-                                  "reason": "no corrections left this round"}
+                        ep.aligned_frames += 1
                     else:
-                        result = execute(robot, action, amount, state, caps, args)
-                        if result.get("terminal"):
-                            term = ("failure", "agent requested stop", False)
-                        elif result.get("fault") == "server":
-                            term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
-                if check_only and term is None:
-                    round_miss = True
+                        ep.stable = 0
+                    ep.longest_stable = max(ep.longest_stable, ep.stable)
+                    if action == "finish":
+                        if not aligned_now:
+                            result = local_refusal("finish needs the target visible and within %g px" % args.tol)
+                        else:
+                            action, amount = "hold", None
+                            result = {"route": None, "status": "done", "fault": None,
+                                      "reason": "finish treated as hold in track mode"}
+                            if args.end_on_aligned and ep.stable >= args.k_stable:
+                                term = ("success", "aligned and held in track mode", True)
+                    else:
+                        if args.deadband_guard and aligned_now and action != "stop":
+                            ep.guard_would_hold += 1
+                            action, amount = "hold", None
+                            result = {"route": None, "status": "done", "fault": None,
+                                      "reason": "deadband guard: hold while aligned"}
+                        else:
+                            result = execute(robot, action, amount, state, caps, args)
+                            if result.get("terminal"):
+                                term = ("failure", "agent requested stop", False)
+                            elif result.get("fault") == "server":
+                                term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
+                            elif aligned_now and result.get("route") in MOTION_ROUTES:
+                                ep.chatter_while_aligned += 1
+                else:
+                    used_before = ep.round_used
+                    check_only = used_before >= args.attempts_per_round   # chances used up: this frame only checks
+                    if not check_only:
+                        ep.round_used += 1
+                    if action == "finish":
+                        if not vis or off is None or abs(off) > args.tol:
+                            ep.stable = 0
+                            if check_only:
+                                result = {"route": None, "status": "not_executed", "fault": None,
+                                          "reason": "not aligned on the check frame"}
+                            else:
+                                result = local_refusal("finish needs the target visible and within %g px" % args.tol)
+                        else:
+                            ep.stable += 1
+                            result = {"route": None, "status": "done", "fault": None,
+                                      "reason": "confirming alignment %d/%d" % (ep.stable, args.k_stable)}
+                            if ep.stable >= args.k_stable:
+                                ep.hit_chances = used_before
+                                term = ("success", "aligned in round %d after %d chance(s) used"
+                                        % (ep.round_no, used_before), True)
+                    else:
+                        ep.stable = 0
+                        if check_only and action != "stop":          # a stop request is always honoured
+                            action, amount = "hold", None
+                            result = {"route": None, "status": "not_executed", "fault": None,
+                                      "reason": "no corrections left this round"}
+                        else:
+                            result = execute(robot, action, amount, state, caps, args)
+                            if result.get("terminal"):
+                                term = ("failure", "agent requested stop", False)
+                            elif result.get("fault") == "server":
+                                term = ("failure", "server %s: %s" % (result.get("status"), result.get("reason")), False)
+                    if check_only and term is None:
+                        round_miss = True
             print("      ->", {k: v for k, v in result.items() if k != "fault"})
 
             # bookkeeping: lost counter, invalid-action counter, pending log record
             ep.lost = 0 if vis else ep.lost + 1
             if not S.active and not vis and ep.lost >= args.n_lost_max and term is None:
                 S = Search(dir=pick_dir(args, ep.last_off), scans=S.scans + 1, steps=S.steps, first=False)   # lost: search again
+                ep.search_starts += 1
                 ep.lost = 0
                 print("      search: target lost for %d steps, starting scan %d towards the %s"
                       % (args.n_lost_max, S.scans, "left" if S.dir > 0 else "right"))
@@ -986,8 +1061,15 @@ def run(args):
             ep.pending = dict(
                 moved=result.get("route") in MOTION_ROUTES, fault=result.get("fault"),
                 record=dict(
-                    episode_id=episode_id, phase=phase0, round=ep.round_no, chances_used=ep.round_used, step_idx=step, timestamp=time.time(), frame=frame_path.name,
+                    episode_id=episode_id, schema_version=2, mode="llm_pure_vision", run_mode=run_mode,
+                    phase=phase0, round=(ep.round_no if run_mode == "shoot" else None),
+                    chances_used=(ep.round_used if run_mode == "shoot" else None),
+                    step_idx=step, timestamp=time.time(), frame=frame_path.name,
+                    capture_time_s=round(capture_t - ep.t0, 3), llm_done_time_s=round((t0 + llm_s) - ep.t0, 3),
+                    execute_done_time_s=round(time.time() - ep.t0, 3), frame_age_s=meta.get("age_s"),
                     state_summary=now, observation=d["observation"], action=action, amount=amount,
+                    aligned=bool(vis and off is not None and abs(off) <= args.tol),
+                    guard_would_hold=bool(vis and off is not None and abs(off) <= args.tol and action in ("rotate_robot", "pan_camera", *MOVE_ACTIONS)),
                     route_called=result.get("route"), server_status=result.get("status"),
                     server_reason=result.get("reason"),
                     details={k: v for k, v in result.items()
@@ -997,7 +1079,7 @@ def run(args):
             history.append(("[search] " if phase0 == "search" else "")
                            + history_line(step, dict(d, action=action, amount=amount), result))
             prev_b64 = b64
-            if round_miss and term is None:                    # check frame not aligned: the object moves
+            if run_mode == "shoot" and round_miss and term is None:                    # check frame not aligned: the object moves
                 if ep.round_no >= args.max_rounds:
                     term = ("failure", "round limit reached: not aligned in %d round(s)" % ep.round_no, False)
                 else:
@@ -1018,11 +1100,13 @@ def run(args):
                                        "steps no longer apply; look at the new frame. ---" % ep.round_no)
                         S = Search(dir=pick_dir(args, ep.last_off), scans=S.scans, steps=S.steps)
                         print("      round %d starts" % ep.round_no)
+            last_step_end = time.time()
             if term:
                 termination = term
                 break
         else:
-            termination = ("failure", "step limit reached", False)
+            termination = (("done", "step limit reached", False) if run_mode == "track"
+                           else ("failure", "step limit reached", False))
     except KeyboardInterrupt:
         print("\nInterrupted.")
         termination = ("interrupted", "keyboard interrupt", False)
@@ -1034,18 +1118,27 @@ def run(args):
         status, reason, success = termination or ("failure", "unknown", False)
         finalize(ep, log, args, None, done=True, done_reason=reason, success=success)
         log.close()
-        summary = dict(episode_id=episode_id, mode="llm_pure_vision", status=status,
+        aligned_share = (ep.aligned_frames / ep.track_frames) if ep.track_frames else 0.0
+        summary = dict(episode_id=episode_id, schema_version=2, mode="llm_pure_vision", run_mode=run_mode, status=status,
                        total_reward=round(ep.total_reward, 3), steps=ep.steps,
                        duration_s=round(time.time() - ep.t0, 1), final_alignment_error_px=ep.last_err,
                        error_source="llm_estimate", termination_reason=reason, model=model,
                        align_steps=ep.align_steps,
-                       rounds=dict(rounds_started=ep.round_no, rounds_missed=ep.misses, max_rounds=args.max_rounds,
-                                   attempts_per_round=args.attempts_per_round,
-                                   aligned_at=dict(round=ep.round_no, chances_used=ep.hit_chances)
-                                   if status == "success" else None),
+                       rounds=(dict(rounds_started=ep.round_no, rounds_missed=ep.misses, max_rounds=args.max_rounds,
+                                    attempts_per_round=args.attempts_per_round,
+                                    aligned_at=dict(round=ep.round_no, chances_used=ep.hit_chances)
+                                    if status == "success" else None)
+                               if run_mode == "shoot" else None),
+                       tracking=dict(frames=ep.track_frames, aligned_frames=ep.aligned_frames,
+                                     aligned_share=round(aligned_share, 3), longest_streak=ep.longest_stable,
+                                     chatter_while_aligned=ep.chatter_while_aligned,
+                                     guard_would_hold=ep.guard_would_hold,
+                                     end_on_aligned=args.end_on_aligned)
+                       if run_mode == "track" else None,
                        search=dict(scans=S.scans, search_steps=S.steps, deg_last_scan=round(S.cum, 1),
                                    found_at_step=S.found_step, scan_step_deg=scan_step,
-                                   views_per_scan=scan_rots + 1, still_searching=S.active),
+                                   views_per_scan=scan_rots + 1, still_searching=S.active,
+                                   starts=ep.search_starts),
                        policy=dict(learning=not args.no_learn, rotate_cap_deg=caps["rot"],
                                    pan_cap_units=caps["pan_step"],
                                    conf_rot=round(L.rot.conf, 3) if L else None,
@@ -1056,7 +1149,7 @@ def run(args):
         print("Log and frames saved in", run_dir)
         if not args.no_learn:                                   # fold this episode into the notes
             try:
-                L2 = learn(args.out, args)
+                L2 = learn(out_root, args, run_mode=run_mode)
                 caps2 = make_caps(lim, args, L2)
                 write_notes(learned_path, render_notes(L2, caps2, args, w_eff, hfov))
                 print("learned notes updated (%s): next run's caps rotate %g deg, pan %d units"
@@ -1066,8 +1159,10 @@ def run(args):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="LLM aiming loop with rounds (pure-vision perception, skills.md playbook).")
+    ap = argparse.ArgumentParser(description="LLM aiming loop with shoot and track modes (pure-vision perception, skills.md playbook).")
     ap.add_argument("--skills", default=str(Path(__file__).with_name("skills.md")), help="playbook file")
+    ap.add_argument("--run-mode", default="shoot", choices=["shoot", "track"],
+                    help="shoot = round-based first-hit mode, track = continuous follow mode")
     ap.add_argument("--learned", default="learned.md", help="learned notes file, rewritten after every run")
     ap.add_argument("--no-learn", action="store_true", help="baseline: ignore past runs, no learned notes")
     ap.add_argument("--learn-window", type=int, default=20, help="newest episodes in --out to learn from")
@@ -1077,18 +1172,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pan-prior-deg-per-unit", type=float, default=0.24,
                     help="unverified guess of degrees per pan unit for the first runs (0 = give no guess)")
     ap.add_argument("--max-steps", type=int, default=25,
-                    help="alignment frames over ALL rounds (search steps are counted separately)")
+                    help="shoot: alignment frames across all rounds; track: total control steps")
     ap.add_argument("--tol", type=float, default=10.0, help="px tolerance for alignment")
     ap.add_argument("--k-stable", type=int, default=1,
-                    help="aligned frames in a row (inside one round) needed to fire; 1 = first alignment ends the run")
+                    help="aligned frames in a row needed for success (shoot) or --end-on-aligned (track)")
     ap.add_argument("--attempts-per-round", type=int, default=2,
-                    help="movement chances per round (corrections and search turns); one more frame then only checks")
+                    help="shoot only: movement chances per round (then one check frame)")
     ap.add_argument("--free-search", action="store_true",
-                    help="search turns do NOT use up the round's chances (default: every search turn counts as a chance)")
-    ap.add_argument("--max-rounds", type=int, default=5, help="rounds (object moves) before giving up")
+                    help="shoot only: search turns do NOT use up round chances")
+    ap.add_argument("--max-rounds", type=int, default=5, help="shoot only: rounds (object moves) before giving up")
     ap.add_argument("--object-move", default="manual", choices=["manual", "wait", "none"],
-                    help="how the next round is triggered: manual = press Enter, wait = --move-wait seconds, none = at once")
-    ap.add_argument("--move-wait", type=float, default=10.0, help="seconds to wait for the object with --object-move wait")
+                    help="shoot only: how the next round is triggered")
+    ap.add_argument("--move-wait", type=float, default=10.0, help="shoot only: seconds to wait for object move with --object-move wait")
     ap.add_argument("--max-rotate", type=float, default=10.0, help="base deg per rotate step before calibration")
     ap.add_argument("--max-rotate-ceiling", type=float, default=25.0,
                     help="deg per rotate step at full calibration confidence (server allows 90)")
@@ -1119,9 +1214,54 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--grid", action="store_true", help="overlay labelled vertical gridlines")
     ap.add_argument("--no-prev", action="store_true", help="do not send the previous frame")
     ap.add_argument("--no-prior", action="store_true", help="do not tell the LLM the field of view")
+    ap.add_argument("--track-seconds", type=float, default=180.0,
+                    help="track mode: maximum wall-clock seconds before ending")
+    ap.add_argument("--min-interval", type=float, default=0.0,
+                    help="track mode: minimum seconds between control steps")
+    ap.add_argument("--end-on-aligned", action="store_true",
+                    help="track mode: end immediately after the first confirmed alignment")
+    ap.add_argument("--deadband-guard", action="store_true",
+                    help="track mode: convert move requests to hold when |offset| <= tolerance")
     ap.add_argument("--out", default="runs")
     return ap
 
 
 if __name__ == "__main__":
     run(build_parser().parse_args())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
