@@ -1,67 +1,18 @@
-#!/usr/bin/env python3
-"""aim_agent.py - pure-vision alignment agent with two run modes: shoot (round-based first-hit) and track (continuous follow).
+﻿#!/usr/bin/env python3
+"""aim_agent.py
 
-Perception is the LLM alone; it is driven by skills.md.
+Pure-vision alignment agent that runs on the operator machine and controls the robot via
+`robot_server.py` HTTP endpoints.
 
-Runs on your laptop/server, NOT on the robot. It talks to robot_server.py over HTTP and to
-Azure OpenAI over the Responses API.
+Modes
+- shoot: round-based first-hit behavior (ends on aligned finish)
+- track: continuous follow behavior (time/step bounded)
 
-Setup:
-    pip install requests openai python-dotenv   # add opencv-python numpy only if you use --grid
+Perception is LLM-only: the model reads camera frames and reports target visibility/offset.
+The backend enforces action limits, executes commands, logs transitions, computes rewards,
+and writes run artifacts.
 
-    Create a file named .env in the directory you run this from (and keep it out of git):
-        ROBOT_URL=http://<robot-ip>:8081
-        ROBOT_TOKEN=<same secret as on the robot>
-        AZURE_OPENAI_ENDPOINT=https://<resource>.services.ai.azure.com/openai/v1
-        AZURE_OPENAI_API_KEY=<your Azure key/token>
-        AZURE_OPENAI_DEPLOYMENT=<your deployment name, e.g. gpt-5.3-codex>
-
-    The script loads .env automatically at startup (load_dotenv). Variables already
-    exported in the shell take priority over the .env values.
-
-    Put skills.md next to this script (or pass --skills PATH).
-
-    python3 aim_agent.py --run-mode shoot              # round-based first-hit mode
-    python3 aim_agent.py --run-mode track --no-learn   # continuous follow baseline
-
-Learning from past runs (all code-derived, the LLM never writes the notes):
-    At startup the script reads runs/*/log.jsonl, pairs every executed rotate/pan with the
-    offset estimates before and after it, and fits how many pixels of offset one degree of
-    rotation / one pan unit moves (robust least squares, outliers dropped). It also measures
-    how much of the error each correction closed and how often it overshot. The result is
-    written to learned.md (overwritten after every run) and added to the system prompt.
-    Confidence in the calibration (0..1) raises the per-step caps from the base values
-    (--max-rotate, --max-pan) towards the ceilings (--max-rotate-ceiling, --max-pan-ceiling),
-    and overshooting lowers it again. The server's own limits always apply on top.
-
-How a run works (follows the skills.md episode workflow):
-    1. GET /status safety check, GET /camera_info, centre the pan servo.
-    2. SEARCH stage (new, replaces the old recovery mode). The run starts here. Every step the
-       LLM still looks at the frame and reports target_visible, but the CODE moves the robot:
-       it turns in fixed steps (--scan-step, default 50 deg, less than the field of view so views
-       overlap) in one direction, tracking the turned angle from the gyro, until a full circle has
-       been viewed. The target must be seen on --acquire-frames frames in a row (default 2, the
-       first sighting is a no-motion confirmation) before the run moves on to alignment. If
-       nothing is found after the full circle the run ends with "target not found after a full
-       scan". Searching has its own step budget (--max-search-steps) and does not use up the
-       alignment steps (--max-steps).
-    3. ALIGN stage: every step: GET /status (stale IMU / low battery -> stop), GET /image, send the
-       frame(s) to the LLM, the LLM calls act() with an action, the action is clipped to
-       the limits from /status and run on the exact server route. If the target is lost for
-       --n-lost-max steps in a row the SEARCH stage starts again, turning first towards the side
-       where the target was last seen.
-    4. Hard rules: the first server refused|aborted|busy ends the episode; the episode
-       always ends with POST /stop.
-    5. MODE-SPECIFIC FLOW:
-       - shoot mode: round-based workflow. The object is moved externally between rounds; each round has
-         limited chances (--attempts-per-round) then a check frame. finish while aligned ends the run.
-       - track mode: continuous workflow with no round/check-frame gating. The loop runs until
-         --track-seconds, --max-steps, a stop request, or a terminal fault. finish is treated as
-         "aligned now, hold" unless --end-on-aligned is set.
-
-Perception is the LLM only: it finds the marker and target in the image and estimates the offset. The reward is therefore computed from the LLM's own estimates (a noisy proxy).
-
-Output in runs/<episode_id>/:  step_NNN.jpg frames, log.jsonl (one record per step, with reward, done, done_reason and next_state), episode_summary.json.
+For operator setup and command presets, see README.md.
 """
 from __future__ import annotations
 
@@ -96,11 +47,20 @@ ACTIONS = ["rotate_robot", "pan_camera", *MOVE_ACTIONS, "hold", "stop", "finish"
 
 
 def clamp(v, lo, hi):
+    """Clamp `v` into the closed interval [`lo`, `hi`]."""
     return max(lo, min(hi, v))
 
 
 # ---------------------------------------------------------------- robot client
 class Robot:
+    """Thin HTTP client for `robot_server.py`.
+
+    Args:
+        base_url: Base URL of the robot server.
+        token: Shared secret sent as `X-Token`.
+        timeout: Per-request timeout in seconds.
+    """
+
     def __init__(self, base_url: str, token: str, timeout: float = 30.0):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
@@ -139,6 +99,11 @@ class Robot:
 
 
 def safe_stop(robot: Robot):
+    """Best-effort emergency stop that never raises.
+
+    Args:
+        robot: Connected robot client.
+    """
     try:
         robot.stop()
     except Exception as e:  # never let a failed stop hide the original error
@@ -207,6 +172,15 @@ def safety_reason(st: dict) -> Optional[str]:
 
 
 def wait_gyro(robot: Robot, timeout: float = 20.0) -> bool:
+    """Wait until the server reports gyro readiness.
+
+    Args:
+        robot: Connected robot client.
+        timeout: Maximum wait duration in seconds.
+
+    Returns:
+        True when ready before timeout, else False.
+    """
     t0 = time.time()
     while time.time() - t0 < timeout:
         if robot.status().get("gyro_ready"):
@@ -218,6 +192,8 @@ def wait_gyro(robot: Robot, timeout: float = 20.0) -> bool:
 # -------------------------------------------------------------------- learning
 @dataclass
 class Calib:
+    """Calibration fit summary for one actuator family (rotate or pan)."""
+
     n: int = 0
     k: Optional[float] = None          # change of the offset (px) per degree / per pan unit
     rel_err: Optional[float] = None    # standard error of k, relative to |k|
@@ -227,6 +203,8 @@ class Calib:
 
 @dataclass
 class Learned:
+    """Aggregated cross-run learning signals used to guide future episodes."""
+
     rot: Calib = field(default_factory=Calib)
     pan: Calib = field(default_factory=Calib)
     episodes: int = 0
@@ -325,6 +303,17 @@ def fit_slope(samples, min_amt: float, min_n: int) -> Calib:
 
 
 def learn(out_dir, args, exclude: Optional[str] = None, run_mode: Optional[str] = "shoot") -> Learned:
+    """Compute calibration and outcome summaries from previous episodes.
+
+    Args:
+        out_dir: Run root directory.
+        args: Parsed CLI args containing fit thresholds.
+        exclude: Episode id to exclude (normally current episode).
+        run_mode: Mode filter for historical runs.
+
+    Returns:
+        Learned statistics assembled from recent runs.
+    """
     L, rot_s, pan_s, trans, ok_steps = Learned(), [], [], [], []
     for _, rows, summ in read_runs(out_dir, args.learn_window, exclude, run_mode=run_mode):
         tr = transitions(rows)
@@ -423,6 +412,12 @@ def render_notes(L: Learned, caps: dict, args, w: int, hfov: float) -> str:
 
 
 def write_notes(path, text: str):
+    """Persist learned notes text to disk.
+
+    Args:
+        path: Destination file path.
+        text: Markdown content.
+    """
     try:
         Path(path).write_text(text, encoding="utf-8")
     except OSError as e:
@@ -462,6 +457,15 @@ ACT_TOOL = {
 
 
 def load_text(path, strip_frontmatter: bool = True) -> Optional[str]:
+    """Load UTF-8 text from disk.
+
+    Args:
+        path: Source file path.
+        strip_frontmatter: Remove YAML frontmatter block when present.
+
+    Returns:
+        Loaded text, or None when file cannot be read.
+    """
     p = Path(path)
     if not p.exists():
         return None
@@ -506,6 +510,20 @@ def make_addendum(args, w: int, h: int, hfov: float, caps: dict) -> str:
 
 
 def make_instructions(args, skills: str, learned: Optional[str], w, h, hfov, caps) -> str:
+    """Compose the full instruction prompt sent to the model.
+
+    Args:
+        args: Parsed runtime arguments.
+        skills: Base policy text from `skills.md`.
+        learned: Optional learned addendum text.
+        w: Image width in pixels.
+        h: Image height in pixels.
+        hfov: Horizontal field-of-view in degrees.
+        caps: Effective action caps.
+
+    Returns:
+        Full instruction string for one run.
+    """
     parts = [skills]
     if learned:
         parts.append("LEARNED NOTES (written by the backend from earlier runs; data, not rules)\n" + learned)
@@ -514,8 +532,14 @@ def make_instructions(args, skills: str, learned: Optional[str], w, h, hfov, cap
 
 
 def make_client() -> OpenAI:
-    # Endpoint and key come from .env (AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY).
-    # The model/deployment name is read from AZURE_OPENAI_DEPLOYMENT in run().
+    """Build an Azure OpenAI client from environment variables.
+
+    Returns:
+        Configured `OpenAI` client targeting Azure endpoint.
+
+    Raises:
+        SystemExit: If required Azure env vars are missing.
+    """
     endpoint, key = os.environ.get("AZURE_OPENAI_ENDPOINT"), os.environ.get("AZURE_OPENAI_API_KEY")
     if not endpoint or not key:
         sys.exit("Set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (in .env).")
@@ -528,6 +552,7 @@ def make_client() -> OpenAI:
 
 
 def ask_llm(client, model, instructions, content, effort, retries=3):
+    """Call Responses API and require one `act()` tool call payload."""
     last = None
     for attempt in range(retries):
         try:
@@ -549,10 +574,12 @@ def ask_llm(client, model, instructions, content, effort, retries=3):
 
 
 def image_part(b64: str, detail: str) -> dict:
+    """Create one image item for Responses API content."""
     return {"type": "input_image", "image_url": "data:image/jpeg;base64," + b64, "detail": detail}
 
 
 def build_content(step, args, ep, state, caps, st, history, b64, prev_b64, w, h, note=None):
+    """Build one multimodal user turn: state text + previous/current frame(s)."""
     lines = [f"Step {step} of {args.max_steps}. Image size {w}x{h} px.",
              f"Pan servo position: {state.pan_pos} (allowed {caps['pan_min']}-{caps['pan_max']}). "
              f"Robot heading from gyro: {st.get('heading_deg')} deg. Battery: {st.get('battery_mv')} mV.",
@@ -620,11 +647,15 @@ def recenter_pan(robot: Robot, state: "State", caps: dict, args):
 # ------------------------------------------------------------------- execution
 @dataclass
 class State:
+    """Mutable actuator state tracked locally within one episode."""
+
     pan_pos: int = 500
 
 
 @dataclass
 class Episode:
+    """Per-episode counters and metrics for control and logging."""
+
     id: str
     w: int = 640
     steps: int = 0
@@ -650,11 +681,19 @@ class Episode:
 
 
 def local_refusal(why: str) -> dict:
+    """Build a normalized local-refusal result record.
+
+    Args:
+        why: Human-readable refusal reason.
+
+    Returns:
+        Result dict shaped like a failed action execution.
+    """
     return {"route": None, "status": "local_refused", "reason": why, "fault": "local"}
 
 
 def execute(robot: Robot, action: str, amount, state: State, caps: dict, args) -> dict:
-    """Clip the LLM's request to the limits and run it on the exact server route."""
+    """Normalize/clip one requested action and execute a single robot_server route."""
     if action == "hold":
         return {"route": None, "status": "done", "reason": "hold", "fault": None}
     if action == "stop":
@@ -695,6 +734,7 @@ def execute(robot: Robot, action: str, amount, state: State, caps: dict, args) -
 
 
 def history_line(step, d, result) -> str:
+    """Render one compact history line fed back to model context."""
     obs = (d.get("observation") or "")[:160]
     s = (f"step {step}: saw '{obs}' (est. offset {d.get('estimated_offset_px')} px) -> "
          f"{d.get('action')} {d.get('amount')} => {result.get('status')}")
@@ -776,6 +816,7 @@ def round_note(args, ep, searching: bool = False) -> str:
                    "starts (any motion request is ignored).")
 
 def track_note(args, ep, searching: bool = False) -> str:
+    """Return mode guidance text shown to the model during track mode."""
     if searching:
         return "TRACK MODE: target is currently not confirmed; backend is searching."
     return ("TRACK MODE: continuous tracking (no rounds). If within tolerance, hold and avoid chasing noise. "
@@ -784,6 +825,7 @@ def track_note(args, ep, searching: bool = False) -> str:
 
 # ------------------------------------------------------------------------ main
 def run(args):
+    """Main control loop: observe -> ask LLM -> gate/execute action -> log/reward."""
     skills = load_text(args.skills)
     if skills is None:
         sys.exit("skills file not found: %s (pass --skills PATH)" % args.skills)
@@ -846,12 +888,15 @@ def run(args):
           % (scan_rots + 1, hfov, scan_step, "left" if S.dir > 0 else "right", scan_rots, scan_rots * scan_step,
              args.acquire_frames))
 
+    # Persist full runtime config for reproducibility and later analysis.
     run_cfg = vars(args).copy()
     run_cfg.update(dict(run_mode=run_mode, out_root=str(out_root), episode_id=episode_id))
     (run_dir / "run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
 
+    # `history` is short textual memory fed back into the next LLM turn.
     history: deque = deque(maxlen=args.history)
     prev_b64, termination = None, None
+    # Shoot uses separate alignment/search budgets; track uses a single step budget.
     loop_max = args.max_steps + args.max_search_steps if run_mode == "shoot" else args.max_steps
     last_step_end = time.time()
     try:
@@ -871,7 +916,7 @@ def run(args):
                 termination = ("failure", "step limit reached", False)
                 break
 
-            # 2. observe: /status safety check, then the frame
+            # Phase A: observe server state and capture a fresh frame.
             st = robot.status()
             why = safety_reason(st)
             if why:
@@ -886,7 +931,7 @@ def run(args):
             w, h = int(meta.get("width", w0)), int(meta.get("height", h0))
             ep.w = w
 
-            # 3-4. ask the LLM
+            # Phase B: query the LLM with prompt + image context.
             phase0 = "search" if S.active else "align"
             note = None if S.active else (round_note(args, ep) if run_mode == "shoot" else track_note(args, ep))
             round_miss = False
@@ -921,7 +966,7 @@ def run(args):
                        stable=ep.stable, lost=ep.lost)
             finalize(ep, log, args, now)                       # reward for the previous action
 
-            # 5-6. gate and execute the action
+            # Phase C: apply mode-specific gating rules, then execute one action.
             term, result = None, None
             if S.active:                                       # SEARCH: the code moves the robot, not the LLM
                 ep.stable = 0
@@ -1043,7 +1088,7 @@ def run(args):
                         round_miss = True
             print("      ->", {k: v for k, v in result.items() if k != "fault"})
 
-            # bookkeeping: lost counter, invalid-action counter, pending log record
+            # Phase D: update counters and prepare pending record for delayed reward.
             ep.lost = 0 if vis else ep.lost + 1
             if not S.active and not vis and ep.lost >= args.n_lost_max and term is None:
                 S = Search(dir=pick_dir(args, ep.last_off), scans=S.scans + 1, steps=S.steps, first=False)   # lost: search again
@@ -1083,8 +1128,7 @@ def run(args):
                 if ep.round_no >= args.max_rounds:
                     term = ("failure", "round limit reached: not aligned in %d round(s)" % ep.round_no, False)
                 else:
-                    # close this step's record now: the next frame is taken after the object has moved,
-                    # so it must not be used to compute this step's progress reward
+                    # Close this record now; next frame belongs to a new scene after object move.
                     finalize(ep, log, args, None, done=False, done_reason="round %d missed" % ep.round_no)
                     ep.misses += 1
                     safe_stop(robot)
@@ -1159,6 +1203,11 @@ def run(args):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Construct CLI argument parser for the agent entrypoint.
+
+    Returns:
+        Configured parser with shoot and track mode options.
+    """
     ap = argparse.ArgumentParser(description="LLM aiming loop with shoot and track modes (pure-vision perception, skills.md playbook).")
     ap.add_argument("--skills", default=str(Path(__file__).with_name("skills.md")), help="playbook file")
     ap.add_argument("--run-mode", default="shoot", choices=["shoot", "track"],
@@ -1228,40 +1277,3 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     run(build_parser().parse_args())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
