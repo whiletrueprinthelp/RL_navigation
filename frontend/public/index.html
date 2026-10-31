@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aim Agent Dashboard</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="panel panel-left">
+        <header class="panel-header">
+          <h1>LLM Messages</h1>
+          <span id="statusBadge" class="status idle">Idle</span>
+        </header>
+        <div id="logPane" class="log-pane" aria-live="polite"></div>
+      </section>
+
+      <section class="panel panel-right">
+        <div class="feed-card">
+          <div class="feed-header">
+            <h2>Robot Feed</h2>
+            <span id="feedMeta">Waiting for frame...</span>
+          </div>
+          <div class="feed-viewport">
+            <img id="feedImage" alt="Robot camera feed" />
+            <div id="feedFallback" class="feed-fallback">No frame yet</div>
+          </div>
+        </div>
+
+        <div class="controls-card">
+          <button id="startShootBtn" class="btn primary">Start Shoot</button>
+          <button id="startTrackBtn" class="btn primary">Start Track</button>
+          <button id="objectMovedBtn" class="btn secondary" disabled>Object Moved</button>
+          <button id="stopBtn" class="btn danger">Stop Agent</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
+

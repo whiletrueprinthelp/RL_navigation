@@ -1,0 +1,19 @@
+{
+  "name": "aim-agent-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Simple dashboard for robot feed + aim_agent control",
+  "main": "server.js",
+  "scripts": {
+    "dev": "nodemon server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
