@@ -28,7 +28,7 @@ The agent (`aim_agent.py`) reads camera frames from `robot_server.py`, asks the 
 
 1. JetAuto robot runs ROS2 and `robot_server.py`.
 2. Operator machine runs `aim_agent.py`.
-3. Both are on the same network.
+3. Both are on the same _stable_ network.
 4. Operator machine has Azure OpenAI credentials in `.env`.
 5. A visible target object is in camera view (or searchable by scan).
 

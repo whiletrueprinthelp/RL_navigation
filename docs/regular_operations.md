@@ -20,6 +20,8 @@ ros_robot_controller
 
 Also, run `ros2 topic echo /ros_robot_controller/battery --once` to see if data appears. A number ranging from 9500 to 12000+ would appear. Beware that the robot would start beeping around 9500+, signalling **low battery**. 
 
+If the nodes do not turn on after a while, run `sudo systemctl restart start_app_node.service`. This will restart the script that "activates" the required nodes. 
+
 After the nodes are turned on and the battery topic is giving an output, then you can run: 
 ```
 export ROBOT_TOKEN=secret
