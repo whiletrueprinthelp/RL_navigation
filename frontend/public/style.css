@@ -166,13 +166,13 @@ body {
 }
 
 .controls-card {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  display: flex;
   gap: 8px;
   padding: 10px;
 }
 
 .btn {
+  flex: 1;
   border: 1px solid var(--border);
   border-radius: 9px;
   height: 42px;

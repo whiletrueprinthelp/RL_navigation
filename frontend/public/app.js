@@ -12,7 +12,7 @@ const objectMovedBtn = document.getElementById('objectMovedBtn');
 const stopBtn = document.getElementById('stopBtn');
 
 let state = { running: false, mode: null, awaitingObjectMove: false };
-let frameTimer = null;
+let activeErrorTextNode = null;
 
 function formatTime(ts) {
   try {
@@ -33,15 +33,35 @@ function setState(next) {
     statusBadge.className = 'status idle';
   }
 
-  startShootBtn.disabled = state.running;
-  startTrackBtn.disabled = state.running;
-  objectMovedBtn.disabled = !(state.running && state.mode === 'shoot' && state.awaitingObjectMove);
-  stopBtn.disabled = !state.running;
+  const inShootMode = state.running && state.mode === 'shoot';
+  const inTrackMode = state.running && state.mode === 'track';
+
+  startShootBtn.style.display = state.running ? 'none' : 'inline-block';
+  startTrackBtn.style.display = state.running ? 'none' : 'inline-block';
+
+  objectMovedBtn.style.display = inShootMode ? 'inline-block' : 'none';
+  objectMovedBtn.disabled = !state.awaitingObjectMove;
+
+  stopBtn.style.display = state.running ? 'inline-block' : 'none';
+  stopBtn.disabled = !(inShootMode || inTrackMode);
 }
 
 function appendMessage(msg) {
   const nearBottom = logPane.scrollTop + logPane.clientHeight >= logPane.scrollHeight - 24;
   const isAgentExit = /^Agent exited \(code=.*\)\.$/i.test(msg.text || '');
+  const isError = (msg.source || 'agent') === 'error';
+
+  if (!isError) {
+    activeErrorTextNode = null;
+  }
+
+  if (isError && activeErrorTextNode) {
+    activeErrorTextNode.textContent += `\n${msg.text || ''}`;
+    if (nearBottom) {
+      logPane.scrollTop = logPane.scrollHeight;
+    }
+    return;
+  }
 
   const box = document.createElement('article');
   box.className = `msg ${msg.source || 'agent'}${isAgentExit ? ' exit-msg' : ''}`;
@@ -53,6 +73,10 @@ function appendMessage(msg) {
   const text = document.createElement('div');
   text.className = 'text';
   text.textContent = msg.text || '';
+
+  if (isError) {
+    activeErrorTextNode = text;
+  }
 
   box.append(meta, text);
   logPane.appendChild(box);
@@ -76,6 +100,7 @@ async function fetchMessages() {
   const r = await fetch('/api/messages');
   const data = await r.json();
   logPane.innerHTML = '';
+  activeErrorTextNode = null;
   for (const msg of data.messages || []) {
     appendMessage(msg);
   }
@@ -109,34 +134,31 @@ async function confirmObjectMoved() {
   }
 }
 
-async function refreshFrame() {
+async function initLiveStream() {
   try {
-    const r = await fetch('/api/frame');
+    const r = await fetch('/api/feed-source');
     const data = await r.json();
-    if (!data.ok || !data.frameDataUrl) {
+    if (!data.ok || !data.streamUrl) {
       feedImage.style.display = 'none';
       feedFallback.style.display = 'block';
-      feedMeta.textContent = data.reason || 'Frame unavailable';
+      feedMeta.textContent = data.reason || 'Live stream unavailable';
       return;
     }
 
-    feedImage.src = data.frameDataUrl;
+    feedMeta.textContent = `${data.robotIp}:8080 stream - topic ${data.topic}`;
     feedImage.style.display = 'block';
     feedFallback.style.display = 'none';
-    feedMeta.textContent = `${data.width}x${data.height} - age ${Number(data.age_s || 0).toFixed(2)}s`;
+    feedImage.onerror = () => {
+      feedImage.style.display = 'none';
+      feedFallback.style.display = 'block';
+      feedMeta.textContent = 'Failed to load live stream';
+    };
+    feedImage.src = data.streamUrl;
   } catch (err) {
     feedImage.style.display = 'none';
     feedFallback.style.display = 'block';
     feedMeta.textContent = String(err);
   }
-}
-
-function startFramePolling() {
-  if (frameTimer) {
-    clearInterval(frameTimer);
-  }
-  refreshFrame();
-  frameTimer = setInterval(refreshFrame, 350);
 }
 
 socket.on('state', setState);
@@ -149,5 +171,5 @@ stopBtn.addEventListener('click', stopMode);
 
 fetchState().catch(() => undefined);
 fetchMessages().catch(() => undefined);
-startFramePolling();
+initLiveStream().catch(() => undefined);
 

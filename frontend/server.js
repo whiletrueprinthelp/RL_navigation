@@ -23,9 +23,11 @@ function requireEnv(name) {
 const PORT = Number(process.env.FRONTEND_PORT || 5173);
 const ROBOT_URL = requireEnv('ROBOT_URL').replace(/\/$/, '');
 const ROBOT_TOKEN = requireEnv('ROBOT_TOKEN');
+const ROBOT_IP = (process.env.ROBOT_IP || '').trim() || new URL(ROBOT_URL).hostname;
+const LIVE_STREAM_TOPIC = process.env.LIVE_STREAM_TOPIC || '/depth_cam/rgb/image_raw';
+const LIVE_STREAM_URL = `http://${ROBOT_IP}:8080/stream?topic=${LIVE_STREAM_TOPIC}`;
 const PYTHON_CMD = process.env.AGENT_PYTHON || 'python';
 const AGENT_SCRIPT = process.env.AGENT_SCRIPT || path.join(REPO_ROOT, 'aim_agent.py');
-const FRAME_WIDTH = Number(process.env.FRAME_WIDTH || 640);
 const MAX_MESSAGES = Number(process.env.MAX_MESSAGES || 500);
 
 const SHOOT_ARGS = splitArgs(process.env.SHOOT_MODE_ARGS || '');
@@ -49,6 +51,8 @@ const runtime = {
   tailOffset: 0,
   messages: [],
 };
+
+const MANUAL_MOVE_PROMPT_RE = /round\s+\d+:\s+move the object, then press Enter \(q \+ Enter ends the run\):/i;
 
 function splitArgs(raw) {
   if (!raw || !raw.trim()) {
@@ -166,7 +170,11 @@ function modeArgs(mode) {
     return [...SHOOT_ARGS, '--object-move', 'manual'];
   }
   if (mode === 'track') {
-    return TRACK_ARGS;
+    const normalizedTrackArgs = TRACK_ARGS.map((arg) => (arg === '--nolearn' ? '--no-learn' : arg));
+    if (normalizedTrackArgs.includes('--no-learn')) {
+      return normalizedTrackArgs;
+    }
+    return [...normalizedTrackArgs, '--no-learn'];
   }
   return [];
 }
@@ -197,7 +205,13 @@ function launchAgent(mode) {
 
   const outRl = readline.createInterface({ input: child.stdout });
   outRl.on('line', (line) => {
-    addMessage({ source: 'agent', text: line });
+    let shownLine = line;
+    if (runtime.awaitingObjectMove) {
+      shownLine = shownLine.replace(MANUAL_MOVE_PROMPT_RE, '').trim();
+    }
+    if (shownLine) {
+      addMessage({ source: 'agent', text: shownLine });
+    }
     if (/move the object now; the agent looks again in/i.test(line)) {
       setAwaitingObjectMove(false);
     }
@@ -209,7 +223,9 @@ function launchAgent(mode) {
 
   child.stdout.on('data', (chunk) => {
     const text = chunk.toString('utf-8');
-    if (/move the object, then press Enter/i.test(text)) {
+    const promptMatch = text.match(MANUAL_MOVE_PROMPT_RE);
+    if (promptMatch && !runtime.awaitingObjectMove) {
+      addMessage({ source: 'agent', text: promptMatch[0] });
       setAwaitingObjectMove(true);
     }
   });
@@ -245,30 +261,13 @@ app.get('/api/messages', (_req, res) => {
   res.json({ messages: runtime.messages.slice(-200) });
 });
 
-app.get('/api/frame', async (req, res) => {
-  const width = Number(req.query.width || FRAME_WIDTH);
-  const url = `${ROBOT_URL}/image?width=${encodeURIComponent(width)}`;
-  try {
-    const r = await fetch(url, {
-      headers: ROBOT_TOKEN ? { 'X-Token': ROBOT_TOKEN } : {},
-    });
-    if (!r.ok) {
-      return res.status(r.status).json({ ok: false, reason: `robot_server returned ${r.status}` });
-    }
-    const payload = await r.json();
-    if (payload?.status !== 'done' || !payload?.image_b64) {
-      return res.status(502).json({ ok: false, reason: 'invalid /image payload', payload });
-    }
-    res.json({
-      ok: true,
-      age_s: payload.age_s,
-      width: payload.width,
-      height: payload.height,
-      frameDataUrl: `data:image/jpeg;base64,${payload.image_b64}`,
-    });
-  } catch (err) {
-    res.status(502).json({ ok: false, reason: String(err) });
-  }
+app.get('/api/feed-source', (_req, res) => {
+  res.json({
+    ok: true,
+    streamUrl: LIVE_STREAM_URL,
+    robotIp: ROBOT_IP,
+    topic: LIVE_STREAM_TOPIC,
+  });
 });
 
 app.post('/api/start', (req, res) => {
@@ -321,7 +320,7 @@ server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`Frontend server running at http://localhost:${PORT}`);
   // eslint-disable-next-line no-console
-  console.log(`Proxying feed from ${ROBOT_URL}/image`);
+  console.log(`Live feed source: ${LIVE_STREAM_URL}`);
 });
 
 process.on('SIGINT', () => {
