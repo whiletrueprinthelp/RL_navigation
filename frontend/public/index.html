@@ -7,11 +7,18 @@
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main class="app-shell">
+    <header class="topbar">
+      <div class="tab-row" role="tablist" aria-label="Dashboard views">
+        <button id="homeTabBtn" class="tab-btn active" role="tab" aria-selected="true">Home</button>
+        <button id="promptTabBtn" class="tab-btn" role="tab" aria-selected="false">Prompt Message</button>
+      </div>
+      <span id="statusBadge" class="status idle">Idle</span>
+    </header>
+
+    <main id="homeView" class="app-shell tab-view active" role="tabpanel">
       <section class="panel panel-left">
         <header class="panel-header">
           <h1>LLM Messages</h1>
-          <span id="statusBadge" class="status idle">Idle</span>
         </header>
         <div id="logPane" class="log-pane" aria-live="polite"></div>
       </section>
@@ -34,6 +41,16 @@
           <button id="objectMovedBtn" class="btn secondary" disabled style="display: none;">Object Moved</button>
           <button id="stopBtn" class="btn danger" style="display: none;">Stop Agent</button>
         </div>
+      </section>
+    </main>
+
+    <main id="promptView" class="prompt-view tab-view" role="tabpanel" aria-hidden="true">
+      <section class="panel prompt-full-panel">
+        <div class="prompt-header">
+          <h2>Exact Prompt Sent to LLM</h2>
+          <span id="promptMeta">Waiting for run...</span>
+        </div>
+        <pre id="promptPane" class="prompt-pane">No run prompt available yet.</pre>
       </section>
     </main>
 

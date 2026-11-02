@@ -424,6 +424,15 @@ def write_notes(path, text: str):
         print("warning: could not write %s: %s" % (path, e))
 
 
+def append_jsonl(path: Path, row: dict):
+    """Append one JSON object as a UTF-8 line to `path`. Best-effort only."""
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print("warning: could not write %s: %s" % (path, e))
+
+
 # ------------------------------------------------------------------------- LLM
 ACT_TOOL = {
     "type": "function",
@@ -551,7 +560,7 @@ def make_client() -> OpenAI:
     return OpenAI(base_url=base + "/", api_key=key)
 
 
-def ask_llm(client, model, instructions, content, effort, retries=3):
+def ask_llm(client, model, instructions, content, effort, retries=3, log_call=None):
     """Call Responses API and require one `act()` tool call payload."""
     last = None
     for attempt in range(retries):
@@ -561,6 +570,11 @@ def ask_llm(client, model, instructions, content, effort, retries=3):
                       tools=[ACT_TOOL], tool_choice="required", max_output_tokens=4000)
             if effort:
                 kw["reasoning"] = {"effort": effort}
+            if log_call:
+                try:
+                    log_call(kw, attempt + 1)
+                except Exception:
+                    pass
             resp = client.responses.create(**kw)
             for item in resp.output:
                 if item.type == "function_call" and item.name == "act":
@@ -841,6 +855,7 @@ def run(args):
     run_dir = out_root / episode_id
     run_dir.mkdir(parents=True, exist_ok=True)
     learned_path = run_dir / Path(args.learned).name
+    prompt_trace_path = run_dir / "llm_prompt_calls.jsonl"
     log = open(run_dir / "log.jsonl", "a", buffering=1)
 
     # 1. readiness: /status, /camera_info, gyro, centre the pan servo
@@ -949,8 +964,19 @@ def run(args):
             content = build_content(step, args, ep, state, caps, st, history, b64,
                                     None if args.no_prev else prev_b64, w, h, note)
             t0 = time.time()
+
+            def log_prompt_call(payload, attempt_no, phase=phase0, step_idx=step):
+                append_jsonl(prompt_trace_path, dict(
+                    timestamp=time.time(),
+                    episode_id=episode_id,
+                    step=step_idx,
+                    phase=phase,
+                    attempt=attempt_no,
+                    request=payload,
+                ))
+
             d, resp = ask_llm(client, model, make_instructions(args, skills, learned, w, h, hfov, caps),
-                              content, args.effort)
+                              content, args.effort, log_call=log_prompt_call)
             llm_s = time.time() - t0
             action, amount = d["action"], d["amount"]
             off, vis = d.get("estimated_offset_px"), bool(d.get("target_visible"))

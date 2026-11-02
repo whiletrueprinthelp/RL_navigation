@@ -47,6 +47,9 @@ const runtime = {
   startedAt: null,
   currentRunDir: null,
   awaitingObjectMove: false,
+  promptTracePath: null,
+  promptTraceOffset: 0,
+  latestPromptRecord: null,
   tailInterval: null,
   tailOffset: 0,
   messages: [],
@@ -106,6 +109,57 @@ function clearTail() {
   runtime.tailOffset = 0;
 }
 
+function clearPromptTrace() {
+  runtime.promptTracePath = null;
+  runtime.promptTraceOffset = 0;
+  runtime.latestPromptRecord = null;
+}
+
+async function refreshPromptTrace() {
+  if (!runtime.promptTracePath) {
+    return;
+  }
+  try {
+    const text = await fsp.readFile(runtime.promptTracePath, 'utf-8');
+    const lines = text.split(/\r?\n/).filter(Boolean);
+
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      try {
+        runtime.latestPromptRecord = JSON.parse(lines[i]);
+        runtime.promptTraceOffset = Buffer.byteLength(text, 'utf-8');
+        return;
+      } catch {
+        // Keep scanning backwards for the latest complete valid JSON line.
+      }
+    }
+  } catch {
+    // file may not exist yet
+  }
+}
+
+function formatPromptRecord(rec) {
+  const request = rec?.request || {};
+  const parts = [
+    `Episode: ${rec.episode_id || 'unknown'}`,
+    `Step: ${rec.step ?? 'n/a'} | Phase: ${rec.phase || 'n/a'} | Attempt: ${rec.attempt ?? 'n/a'}`,
+    `Model: ${request.model || 'n/a'}`,
+    '',
+    'INSTRUCTIONS',
+    String(request.instructions || ''),
+    '',
+    'INPUT',
+    JSON.stringify(request.input || null, null, 2),
+  ];
+  return parts.join('\n');
+}
+
+function resolveRunDir(runDirText) {
+  if (!runDirText || typeof runDirText !== 'string') {
+    return null;
+  }
+  return path.isAbsolute(runDirText) ? runDirText : path.join(REPO_ROOT, runDirText);
+}
+
 async function tailLogFile(logPath) {
   try {
     const stat = await fsp.stat(logPath);
@@ -142,10 +196,16 @@ async function tailLogFile(logPath) {
 }
 
 function startTail(runDir) {
+  const resolvedRunDir = resolveRunDir(runDir);
+  if (!resolvedRunDir) {
+    return;
+  }
   clearTail();
-  runtime.currentRunDir = runDir;
+  clearPromptTrace();
+  runtime.currentRunDir = resolvedRunDir;
+  runtime.promptTracePath = path.join(resolvedRunDir, 'llm_prompt_calls.jsonl');
   emitState();
-  const logPath = path.join(runDir, 'log.jsonl');
+  const logPath = path.join(resolvedRunDir, 'log.jsonl');
   runtime.tailInterval = setInterval(() => {
     tailLogFile(logPath).catch(() => undefined);
   }, 400);
@@ -199,6 +259,7 @@ function launchAgent(mode) {
   runtime.currentRunDir = null;
   runtime.awaitingObjectMove = false;
   clearTail();
+  clearPromptTrace();
 
   addMessage({ source: 'system', text: `Started ${mode} mode: ${PYTHON_CMD} ${args.join(' ')}` });
   emitState();
@@ -259,6 +320,33 @@ app.get('/api/state', (_req, res) => {
 
 app.get('/api/messages', (_req, res) => {
   res.json({ messages: runtime.messages.slice(-200) });
+});
+
+app.get('/api/prompt', async (_req, res) => {
+  await refreshPromptTrace();
+
+  if (runtime.latestPromptRecord) {
+    const rec = runtime.latestPromptRecord;
+    return res.json({
+      ok: true,
+      meta: `LLM call: step ${rec.step ?? 'n/a'} (${rec.phase || 'unknown'}) attempt ${rec.attempt ?? 'n/a'}`,
+      text: formatPromptRecord(rec),
+    });
+  }
+
+  if (!runtime.currentRunDir) {
+    return res.json({
+      ok: true,
+      meta: 'Waiting for run...',
+      text: 'No active run yet. Start shoot/track to display exact LLM prompt calls.',
+    });
+  }
+
+  return res.json({
+    ok: true,
+    meta: `Run ${path.basename(runtime.currentRunDir)} (waiting for first LLM call)`,
+    text: 'Prompt trace file not available yet. Wait for the first LLM call in this run.',
+  });
 });
 
 app.get('/api/feed-source', (_req, res) => {

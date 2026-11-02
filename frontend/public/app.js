@@ -5,6 +5,12 @@ const statusBadge = document.getElementById('statusBadge');
 const feedMeta = document.getElementById('feedMeta');
 const feedImage = document.getElementById('feedImage');
 const feedFallback = document.getElementById('feedFallback');
+const promptMeta = document.getElementById('promptMeta');
+const promptPane = document.getElementById('promptPane');
+const homeTabBtn = document.getElementById('homeTabBtn');
+const promptTabBtn = document.getElementById('promptTabBtn');
+const homeView = document.getElementById('homeView');
+const promptView = document.getElementById('promptView');
 
 const startShootBtn = document.getElementById('startShootBtn');
 const startTrackBtn = document.getElementById('startTrackBtn');
@@ -13,6 +19,24 @@ const stopBtn = document.getElementById('stopBtn');
 
 let state = { running: false, mode: null, awaitingObjectMove: false };
 let activeErrorTextNode = null;
+let promptTimer = null;
+let activeTab = 'home';
+
+function setActiveTab(tab) {
+  activeTab = tab;
+  const onHome = tab === 'home';
+
+  homeTabBtn.classList.toggle('active', onHome);
+  promptTabBtn.classList.toggle('active', !onHome);
+
+  homeTabBtn.setAttribute('aria-selected', String(onHome));
+  promptTabBtn.setAttribute('aria-selected', String(!onHome));
+
+  homeView.classList.toggle('active', onHome);
+  promptView.classList.toggle('active', !onHome);
+
+  promptView.setAttribute('aria-hidden', String(onHome));
+}
 
 function formatTime(ts) {
   try {
@@ -161,6 +185,32 @@ async function initLiveStream() {
   }
 }
 
+async function refreshPrompt() {
+  try {
+    const r = await fetch('/api/prompt');
+    const data = await r.json();
+    if (!data.ok) {
+      promptMeta.textContent = 'Prompt unavailable';
+      promptPane.textContent = data.reason || 'Failed to load prompt context.';
+      return;
+    }
+
+    promptMeta.textContent = data.meta || 'Prompt context';
+    promptPane.textContent = data.text || 'No prompt text available.';
+  } catch (err) {
+    promptMeta.textContent = 'Prompt unavailable';
+    promptPane.textContent = String(err);
+  }
+}
+
+function startPromptPolling() {
+  if (promptTimer) {
+    clearInterval(promptTimer);
+  }
+  refreshPrompt();
+  promptTimer = setInterval(refreshPrompt, 1500);
+}
+
 socket.on('state', setState);
 socket.on('message', appendMessage);
 
@@ -168,8 +218,15 @@ startShootBtn.addEventListener('click', () => startMode('shoot'));
 startTrackBtn.addEventListener('click', () => startMode('track'));
 objectMovedBtn.addEventListener('click', confirmObjectMoved);
 stopBtn.addEventListener('click', stopMode);
+homeTabBtn.addEventListener('click', () => setActiveTab('home'));
+promptTabBtn.addEventListener('click', () => {
+  setActiveTab('prompt');
+  refreshPrompt().catch(() => undefined);
+});
 
 fetchState().catch(() => undefined);
 fetchMessages().catch(() => undefined);
 initLiveStream().catch(() => undefined);
+startPromptPolling();
+setActiveTab(activeTab);
 
