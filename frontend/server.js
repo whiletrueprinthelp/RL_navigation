@@ -55,6 +55,7 @@ const runtime = {
   messages: [],
 };
 
+// Regex used to detect shoot-mode manual intervention prompts emitted by aim_agent.py.
 const MANUAL_MOVE_PROMPT_RE = /round\s+\d+:\s+move the object, then press Enter \(q \+ Enter ends the run\):/i;
 
 function splitArgs(raw) {
@@ -75,6 +76,7 @@ function isRunning() {
 }
 
 function emitState() {
+  // Push current runtime state to all connected dashboard clients.
   io.emit('state', {
     running: isRunning(),
     mode: runtime.mode,
@@ -93,6 +95,7 @@ function setAwaitingObjectMove(value) {
 }
 
 function addMessage(msg) {
+  // Store bounded message history for page reloads and emit live updates.
   const full = { ...msg, ts: new Date().toISOString() };
   runtime.messages.push(full);
   if (runtime.messages.length > MAX_MESSAGES) {
@@ -116,6 +119,7 @@ function clearPromptTrace() {
 }
 
 async function refreshPromptTrace() {
+  // Read the latest prompt trace line written by aim_agent.py for prompt-panel display.
   if (!runtime.promptTracePath) {
     return;
   }
@@ -138,6 +142,7 @@ async function refreshPromptTrace() {
 }
 
 function formatPromptRecord(rec) {
+  // Render one trace record into a readable text block for the Prompt Message tab.
   const request = rec?.request || {};
   const parts = [
     `Episode: ${rec.episode_id || 'unknown'}`,
@@ -154,6 +159,7 @@ function formatPromptRecord(rec) {
 }
 
 function resolveRunDir(runDirText) {
+  // aim_agent prints a relative run directory; normalize to absolute path from repo root.
   if (!runDirText || typeof runDirText !== 'string') {
     return null;
   }
@@ -161,6 +167,7 @@ function resolveRunDir(runDirText) {
 }
 
 async function tailLogFile(logPath) {
+  // Tail log.jsonl and convert rows into UI messages (LLM summary + fallback raw lines).
   try {
     const stat = await fsp.stat(logPath);
     if (stat.size <= runtime.tailOffset) {
@@ -196,6 +203,7 @@ async function tailLogFile(logPath) {
 }
 
 function startTail(runDir) {
+  // Bind log/prompt tailing to the active episode directory.
   const resolvedRunDir = resolveRunDir(runDir);
   if (!resolvedRunDir) {
     return;
@@ -212,6 +220,7 @@ function startTail(runDir) {
 }
 
 function stopAgent(reason = 'stopped') {
+  // Gracefully stop child process via SIGINT so agent can flush artifacts.
   if (!runtime.agent) {
     return false;
   }
@@ -223,6 +232,9 @@ function stopAgent(reason = 'stopped') {
 }
 
 function modeArgs(mode) {
+  // Frontend-side launch policy:
+  // - shoot: force manual object-move flow
+  // - track: force no-learning mode
   if (mode === 'shoot') {
     if (SHOOT_ARGS.includes('--object-move')) {
       return SHOOT_ARGS;
@@ -240,6 +252,7 @@ function modeArgs(mode) {
 }
 
 function launchAgent(mode) {
+  // Spawn aim_agent.py and stream stdout/stderr into dashboard cards.
   const args = [AGENT_SCRIPT, '--run-mode', mode, ...COMMON_ARGS, ...modeArgs(mode)];
   const childEnv = {
     ...process.env,
@@ -276,6 +289,8 @@ function launchAgent(mode) {
     if (/move the object now; the agent looks again in/i.test(line)) {
       setAwaitingObjectMove(false);
     }
+    // Example line: "episode: 20261102_... | dir: runs/..."
+    // Once seen, attach log/prompt readers to that directory.
     const match = line.match(/episode:\s+\S+\s+\|\s+dir:\s+(.+)$/i);
     if (match?.[1]) {
       startTail(match[1].trim());
@@ -323,6 +338,7 @@ app.get('/api/messages', (_req, res) => {
 });
 
 app.get('/api/prompt', async (_req, res) => {
+  // Expose latest traced prompt payload for the Prompt Message tab.
   await refreshPromptTrace();
 
   if (runtime.latestPromptRecord) {
@@ -379,6 +395,7 @@ app.post('/api/stop', (_req, res) => {
 });
 
 app.post('/api/object-moved', (_req, res) => {
+  // Operator acknowledgment endpoint for shoot-mode manual target movement.
   if (!isRunning()) {
     return res.status(409).json({ ok: false, reason: 'agent is not running' });
   }

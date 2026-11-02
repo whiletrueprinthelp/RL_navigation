@@ -17,11 +17,14 @@ The agent (`aim_agent.py`) reads camera frames from `robot_server.py`, asks the 
   - Not-yet-implemented features and rationale: `docs/agent/not_implemented_features.md`
 - **Operations docs**
   - Day-to-day runbook and troubleshooting: `docs/regular_operations.md`
+- **Frontend docs**
+  - Dashboard setup and behavior: `docs/frontend_dashboard.md`
 
 ## Repository Roles
 
 - `robot_server.py`: Runs **on the robot**. Exposes safe HTTP routes (`/status`, `/image`, `/rotate`, `/camera/pan`, `/move`, `/stop`) and enforces hard limits.
 - `aim_agent.py`: Runs **on operator laptop/PC**. Calls `robot_server.py`, calls Azure OpenAI Responses API, and runs shoot/track control loops.
+- `frontend/server.js` + `frontend/public/`: Runs **on operator laptop/PC**. Web dashboard for feed, logs, prompt context, and run controls.
 - `skills.md`: Policy/playbook given to the LLM for visual alignment behavior.
 
 ## System Architecture (Physical Setup)

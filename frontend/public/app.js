@@ -1,5 +1,6 @@
 const socket = io();
 
+// Core dashboard panels.
 const logPane = document.getElementById('logPane');
 const statusBadge = document.getElementById('statusBadge');
 const feedMeta = document.getElementById('feedMeta');
@@ -17,12 +18,14 @@ const startTrackBtn = document.getElementById('startTrackBtn');
 const objectMovedBtn = document.getElementById('objectMovedBtn');
 const stopBtn = document.getElementById('stopBtn');
 
+// Frontend UI state mirrors backend /api/state payload.
 let state = { running: false, mode: null, awaitingObjectMove: false };
 let activeErrorTextNode = null;
 let promptTimer = null;
 let activeTab = 'home';
 
 function setActiveTab(tab) {
+  // Toggle between operational dashboard (Home) and exact prompt viewer.
   activeTab = tab;
   const onHome = tab === 'home';
 
@@ -47,6 +50,7 @@ function formatTime(ts) {
 }
 
 function setState(next) {
+  // Drive button visibility/enablement from current run mode and wait state.
   state = { ...state, ...next };
 
   if (state.running) {
@@ -71,6 +75,7 @@ function setState(next) {
 }
 
 function appendMessage(msg) {
+  // Append one message card; merge consecutive stderr chunks into a single error card.
   const nearBottom = logPane.scrollTop + logPane.clientHeight >= logPane.scrollHeight - 24;
   const isAgentExit = /^Agent exited \(code=.*\)\.$/i.test(msg.text || '');
   const isError = (msg.source || 'agent') === 'error';
@@ -131,6 +136,7 @@ async function fetchMessages() {
 }
 
 async function startMode(mode) {
+  // Start shoot/track via backend launcher.
   const r = await fetch('/api/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -159,6 +165,7 @@ async function confirmObjectMoved() {
 }
 
 async function initLiveStream() {
+  // Fetch direct camera stream URL and bind it to the <img> element.
   try {
     const r = await fetch('/api/feed-source');
     const data = await r.json();
@@ -186,6 +193,7 @@ async function initLiveStream() {
 }
 
 async function refreshPrompt() {
+  // Poll backend for latest traced LLM call payload.
   try {
     const r = await fetch('/api/prompt');
     const data = await r.json();
@@ -204,6 +212,7 @@ async function refreshPrompt() {
 }
 
 function startPromptPolling() {
+  // Keep prompt panel fresh even when hidden so tab switch is instant.
   if (promptTimer) {
     clearInterval(promptTimer);
   }
