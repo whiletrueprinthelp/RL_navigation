@@ -34,6 +34,7 @@ And leave the terminal running. Go to the next section to run the other half of 
 - Other things you would want to care about: 
     - Go to your computer browser, type `<robot-ip>:8080` and you will see a list of camera topics. `depth_cam/rgb/image_raw` is the topic where you get to see the livefeed (snapshot would show a picture) 
         - This helps a lot if you want a simple way to see what the robot camera sees 
+        - `ros2 topic hz /depth_cam/rgb/image_raw` will show you if the camera topic is publishing anything, so you can use this to check when a black screen occurs, whether the camera is actually sending anything back or not
     - If the live feed does not show anything, type `lsusb` to check that the camera is connected amongst the list of connections. 
 
 
