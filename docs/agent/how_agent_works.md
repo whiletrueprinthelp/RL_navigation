@@ -16,7 +16,7 @@ This project uses an **application-layer RL-style loop**: the LLM proposes actio
    Reward is computed at application level from observed transitions (progress, control cost, safety penalties, oscillation, success bonus).
 
 5. **Learn (application layer)**  
-   The app reads previous `runs/*` logs, estimates calibration trends, and rewrites `learned.md` for future runs.
+   The app reads previous logs under the active output root (`--out`, default `runs`; track commonly uses `runs_track`), estimates calibration trends, and rewrites `learned.md` for future runs (unless `--no-learn` is used).
 
 ## What is “RL-style” here?
 - **State**: frame + status + short action/history context.
@@ -36,9 +36,12 @@ This project uses an **application-layer RL-style loop**: the LLM proposes actio
 - Local agent-side refusals are tolerated up to `--max-local-faults`, then the episode is ended.
 
 ## Artifacts and inspectability
-Each run writes to `runs/<episode_id>/`:
+Each run writes to `<out>/<episode_id>/` (for example `runs/...` or `runs_track/...`):
 - `step_###.jpg` (frames)
 - `log.jsonl` (per-step decisions/results/reward)
 - `episode_summary.json` (rollup metrics)
+- `run_config.json` (effective runtime configuration)
+- `learned.md` (run-local copy of backend-generated notes when learning is enabled)
+- `llm_prompt_calls.jsonl` (exact per-call LLM request payload trace)
 
 This makes trajectories and failures easy to audit.

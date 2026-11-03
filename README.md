@@ -18,7 +18,7 @@ The agent (`aim_agent.py`) reads camera frames from `robot_server.py`, asks the 
 - **Operations docs**
   - Day-to-day runbook and troubleshooting: `docs/regular_operations.md`
 - **Frontend docs**
-  - Dashboard setup and behavior: `docs/frontend_dashboard.md`
+  - Dashboard setup and behavior: `docs/frontend/frontend_dashboard.md`
 
 ## Repository Roles
 
@@ -31,6 +31,7 @@ The agent (`aim_agent.py`) reads camera frames from `robot_server.py`, asks the 
 
 1. JetAuto robot runs ROS2 and `robot_server.py`.
 2. Operator machine runs `aim_agent.py`.
+   - Optional: run the Node dashboard in `frontend/` for controls, logs, feed, and prompt view.
 3. Both are on the same _stable_ network.
 4. Operator machine has Azure OpenAI credentials in `.env`.
 5. A visible target object is in camera view (or searchable by scan).
@@ -75,6 +76,8 @@ AZURE_OPENAI_DEPLOYMENT=<deployment-name>
 ```
 
 Head to `docs/regular_operations.md` for more detailed step-by-step in running the project.
+
+Alternatively, head to `docs/frontend/frontend_dashboard.md` for a frontend interface of activating this project. 
 
 ## Run Modes
 
@@ -128,6 +131,7 @@ Each run writes to `runs/<episode_id>/` (or `runs_track/<episode_id>/` if using 
 - `episode_summary.json`: run summary and metrics.
 - `run_config.json`: exact runtime configuration for reproducibility.
 - `learned.md` (run-local copy): backend-written learned notes from prior runs.
+- `llm_prompt_calls.jsonl`: exact per-call LLM request payload traces (model, instructions, and input payload).
 
 ## Learning and Reward Model
 
