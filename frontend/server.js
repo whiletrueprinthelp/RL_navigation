@@ -44,12 +44,14 @@ app.use(express.static(path.join(FRONTEND_ROOT, 'public')));
 const runtime = {
   agent: null,
   mode: null,
+  target: null,
   startedAt: null,
   currentRunDir: null,
   awaitingObjectMove: false,
   promptTracePath: null,
   promptTraceOffset: 0,
   latestPromptRecord: null,
+  llmStepsSeen: new Set(),
   tailInterval: null,
   tailOffset: 0,
   messages: [],
@@ -80,6 +82,7 @@ function emitState() {
   io.emit('state', {
     running: isRunning(),
     mode: runtime.mode,
+    target: runtime.target,
     startedAt: runtime.startedAt,
     runDir: runtime.currentRunDir,
     awaitingObjectMove: runtime.awaitingObjectMove,
@@ -104,6 +107,15 @@ function addMessage(msg) {
   io.emit('message', full);
 }
 
+function sanitizeMessageForDashboard(text) {
+  if (typeof text !== 'string' || !text) {
+    return text;
+  }
+
+  // Hide run directory paths while preserving episode context text.
+  return text.replace(/(episode:\s+\S+\s+\|\s+dir:\s+).+$/i, '$1<hidden>');
+}
+
 function clearTail() {
   if (runtime.tailInterval) {
     clearInterval(runtime.tailInterval);
@@ -116,6 +128,17 @@ function clearPromptTrace() {
   runtime.promptTracePath = null;
   runtime.promptTraceOffset = 0;
   runtime.latestPromptRecord = null;
+  runtime.llmStepsSeen.clear();
+}
+
+function parseLlmStepFromStdout(line) {
+  // Example: "[1] search  15.8s  rotate_robot 17.3  offset~-250  vis=True  | ..."
+  const match = line.match(/^\[(\d+)\]\s+(search|align)\s+/i);
+  if (!match) {
+    return null;
+  }
+  const stepIdx = Number(match[1]);
+  return Number.isFinite(stepIdx) ? stepIdx : null;
 }
 
 async function refreshPromptTrace() {
@@ -186,6 +209,13 @@ async function tailLogFile(logPath) {
     for (const line of lines) {
       try {
         const row = JSON.parse(line);
+        const stepIdx = Number(row.step_idx);
+        if (Number.isFinite(stepIdx) && runtime.llmStepsSeen.has(stepIdx)) {
+          continue;
+        }
+        if (Number.isFinite(stepIdx)) {
+          runtime.llmStepsSeen.add(stepIdx);
+        }
         const obs = row.observation || '';
         const action = row.action || 'unknown';
         const amount = row.amount === null || row.amount === undefined ? '' : ` ${row.amount}`;
@@ -251,9 +281,9 @@ function modeArgs(mode) {
   return [];
 }
 
-function launchAgent(mode) {
+function launchAgent(mode, target) {
   // Spawn aim_agent.py and stream stdout/stderr into dashboard cards.
-  const args = [AGENT_SCRIPT, '--run-mode', mode, ...COMMON_ARGS, ...modeArgs(mode)];
+  const args = [AGENT_SCRIPT, '--run-mode', mode, '--target', target, ...COMMON_ARGS, ...modeArgs(mode)];
   const childEnv = {
     ...process.env,
     PYTHONIOENCODING: 'utf-8',
@@ -268,23 +298,34 @@ function launchAgent(mode) {
 
   runtime.agent = child;
   runtime.mode = mode;
+  runtime.target = target;
   runtime.startedAt = new Date().toISOString();
   runtime.currentRunDir = null;
   runtime.awaitingObjectMove = false;
   clearTail();
   clearPromptTrace();
 
-  addMessage({ source: 'system', text: `Started ${mode} mode: ${PYTHON_CMD} ${args.join(' ')}` });
+  addMessage({
+    source: 'system',
+    text: `Started ${mode} mode (target: ${target}): ${PYTHON_CMD} ${path.basename(AGENT_SCRIPT)} --run-mode ${mode}`,
+  });
   emitState();
 
   const outRl = readline.createInterface({ input: child.stdout });
   outRl.on('line', (line) => {
+    const llmStepIdx = parseLlmStepFromStdout(line);
+    if (llmStepIdx !== null) {
+      runtime.llmStepsSeen.add(llmStepIdx);
+      addMessage({ source: 'llm', text: sanitizeMessageForDashboard(line) });
+      return;
+    }
+
     let shownLine = line;
     if (runtime.awaitingObjectMove) {
       shownLine = shownLine.replace(MANUAL_MOVE_PROMPT_RE, '').trim();
     }
     if (shownLine) {
-      addMessage({ source: 'agent', text: shownLine });
+      addMessage({ source: 'agent', text: sanitizeMessageForDashboard(shownLine) });
     }
     if (/move the object now; the agent looks again in/i.test(line)) {
       setAwaitingObjectMove(false);
@@ -316,6 +357,7 @@ function launchAgent(mode) {
     addMessage({ source: 'system', text: `Agent exited (code=${code}, signal=${signal || 'none'}).` });
     runtime.agent = null;
     runtime.mode = null;
+    runtime.target = null;
     runtime.startedAt = null;
     runtime.currentRunDir = null;
     runtime.awaitingObjectMove = false;
@@ -327,6 +369,7 @@ app.get('/api/state', (_req, res) => {
   res.json({
     running: isRunning(),
     mode: runtime.mode,
+    target: runtime.target,
     startedAt: runtime.startedAt,
     runDir: runtime.currentRunDir,
     awaitingObjectMove: runtime.awaitingObjectMove,
@@ -376,14 +419,20 @@ app.get('/api/feed-source', (_req, res) => {
 
 app.post('/api/start', (req, res) => {
   const mode = req.body?.mode;
+  const requestedTarget = typeof req.body?.target === 'string' ? req.body.target.trim() : '';
+  const target = requestedTarget || 'a blue bottle';
+
   if (!['shoot', 'track'].includes(mode)) {
     return res.status(400).json({ ok: false, reason: 'mode must be shoot or track' });
+  }
+  if (!target || target.length > 120) {
+    return res.status(400).json({ ok: false, reason: 'target must be 1-120 characters' });
   }
   if (isRunning()) {
     return res.status(409).json({ ok: false, reason: 'agent already running' });
   }
-  launchAgent(mode);
-  res.json({ ok: true });
+  launchAgent(mode, target);
+  res.json({ ok: true, target });
 });
 
 app.post('/api/stop', (_req, res) => {
@@ -415,6 +464,7 @@ io.on('connection', (socket) => {
   socket.emit('state', {
     running: isRunning(),
     mode: runtime.mode,
+    target: runtime.target,
     startedAt: runtime.startedAt,
     runDir: runtime.currentRunDir,
     awaitingObjectMove: runtime.awaitingObjectMove,

@@ -5,6 +5,7 @@ Simple Node.js dashboard to:
 - view the live robot camera feed from ROS MJPEG stream (`http://<ROBOT_IP>:8080/stream?topic=/depth_cam/rgb/image_raw`)
 - watch agent/LLM/system messages in a scrollable panel
 - start the Python agent in `shoot` or `track` mode
+- set the run target text passed into the agent run parameters
 - stop the running agent
 - inspect exact prompt payloads sent to the LLM
 
@@ -13,7 +14,7 @@ Simple Node.js dashboard to:
 - `Home` tab:
   - left: live message stream (agent, llm-derived lines, system, errors)
   - right: robot feed
-  - below feed: mode/run controls
+  - below feed: target input + mode/run controls
 - `Prompt Message` tab:
   - full-width prompt panel showing the latest traced LLM call payload
 

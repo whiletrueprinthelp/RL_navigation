@@ -27,7 +27,7 @@ After the nodes are turned on and the battery topic is giving an output, then yo
 export ROBOT_TOKEN=secret
 python3 robot_server.py
 ```
-And leave the terminal running. Go to the next section to run the other half of this project. 
+And leave the terminal running. Go to the next section (either running aim_agent.py directly or frontend) to run the other half of this project. 
 
 * Note: Open another terminal to run `ros2 topic echo /ros_robot_controller/battery --once` periodically so that you do not get jumpscared when the robot runs out of battery
 
@@ -54,5 +54,13 @@ python3 aim_agent.py --run-mode track --out runs_track --track-seconds 180
 - track mode ends once the timer is up (your timer is `--track-seconds`, so vary the number to get desired duration)
 - Add `--no-learn` if you don't want the agent to read past logs. Usually applied more for track mode because the object is "steadily moving", so the learning of pixels can be a bit iffy since offset between target and marker is due to the target moving also. 
 
+## Running frontend 
 
-_"The greatest limitation of this project is latency."_
+If you don't want to run `aim_agent.py` on the terminal, use frontend. 
+
+On the terminal, run these commands: 
+```powershell
+cd frontend
+npm run dev
+```
+

@@ -210,8 +210,38 @@ body {
 
 .controls-card {
   display: flex;
-  gap: 8px;
+  flex-direction: column;
+  gap: 10px;
   padding: 10px;
+}
+
+.target-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.target-input {
+  width: 100%;
+  height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 10px;
+  font-size: 14px;
+  color: var(--text);
+  background: #fff;
+}
+
+.target-input:disabled {
+  background: #f8fafc;
+  color: var(--muted);
+}
+
+.control-buttons {
+  display: flex;
+  gap: 8px;
 }
 
 .prompt-card {

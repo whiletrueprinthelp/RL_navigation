@@ -17,12 +17,34 @@ const startShootBtn = document.getElementById('startShootBtn');
 const startTrackBtn = document.getElementById('startTrackBtn');
 const objectMovedBtn = document.getElementById('objectMovedBtn');
 const stopBtn = document.getElementById('stopBtn');
+const targetInput = document.getElementById('targetInput');
 
 // Frontend UI state mirrors backend /api/state payload.
 let state = { running: false, mode: null, awaitingObjectMove: false };
 let activeErrorTextNode = null;
 let promptTimer = null;
 let activeTab = 'home';
+let promptHistory = [];
+let lastPromptKey = null;
+const MAX_PROMPT_HISTORY = 120;
+
+function isPromptRecord(meta) {
+  return typeof meta === 'string' && meta.startsWith('LLM call:');
+}
+
+function renderPromptHistory() {
+  if (!promptHistory.length) {
+    promptPane.textContent = 'No run prompt available yet.';
+    return;
+  }
+
+  const blocks = promptHistory.map((entry, idx) => {
+    const header = `=== Prompt ${idx + 1} | ${entry.meta} ===`;
+    return `${header}\n${entry.text}`;
+  });
+
+  promptPane.textContent = blocks.join('\n\n');
+}
 
 function setActiveTab(tab) {
   // Toggle between operational dashboard (Home) and exact prompt viewer.
@@ -66,6 +88,11 @@ function setState(next) {
 
   startShootBtn.style.display = state.running ? 'none' : 'inline-block';
   startTrackBtn.style.display = state.running ? 'none' : 'inline-block';
+  targetInput.disabled = state.running;
+
+  if (state.running && typeof state.target === 'string' && state.target.trim()) {
+    targetInput.value = state.target;
+  }
 
   objectMovedBtn.style.display = inShootMode ? 'inline-block' : 'none';
   objectMovedBtn.disabled = !state.awaitingObjectMove;
@@ -137,14 +164,19 @@ async function fetchMessages() {
 
 async function startMode(mode) {
   // Start shoot/track via backend launcher.
+  const target = (targetInput.value || '').trim() || 'a blue bottle';
   const r = await fetch('/api/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({ mode, target }),
   });
   const data = await r.json();
   if (!data.ok) {
     appendMessage({ source: 'error', text: `Start failed: ${data.reason}` });
+    return;
+  }
+  if (data.target) {
+    targetInput.value = data.target;
   }
 }
 
@@ -203,8 +235,34 @@ async function refreshPrompt() {
       return;
     }
 
-    promptMeta.textContent = data.meta || 'Prompt context';
-    promptPane.textContent = data.text || 'No prompt text available.';
+    const meta = data.meta || 'Prompt context';
+    const text = data.text || 'No prompt text available.';
+
+    if (isPromptRecord(meta)) {
+      const promptKey = `${meta}\n${text}`;
+      if (promptKey !== lastPromptKey) {
+        promptHistory.push({ meta, text });
+        if (promptHistory.length > MAX_PROMPT_HISTORY) {
+          promptHistory = promptHistory.slice(-MAX_PROMPT_HISTORY);
+        }
+        lastPromptKey = promptKey;
+      }
+
+      promptMeta.textContent = `Prompt history (${promptHistory.length})`;
+      const nearBottom = promptPane.scrollTop + promptPane.clientHeight >= promptPane.scrollHeight - 24;
+      renderPromptHistory();
+      if (nearBottom) {
+        promptPane.scrollTop = promptPane.scrollHeight;
+      }
+      return;
+    }
+
+    promptMeta.textContent = meta;
+    if (promptHistory.length) {
+      renderPromptHistory();
+    } else {
+      promptPane.textContent = text;
+    }
   } catch (err) {
     promptMeta.textContent = 'Prompt unavailable';
     promptPane.textContent = String(err);

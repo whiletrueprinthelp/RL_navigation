@@ -104,6 +104,7 @@ Mode-specific term:
 General:
 
 - `--run-mode shoot`
+- `--target "a blue bottle"`
 - `--skills skills.md`
 - `--learned learned.md`
 - `--no-learn` disabled by default

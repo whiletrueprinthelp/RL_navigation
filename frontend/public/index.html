@@ -38,10 +38,16 @@
         </div>
 
         <div class="controls-card">
-          <button id="startShootBtn" class="btn primary">Start Shoot</button>
-          <button id="startTrackBtn" class="btn primary">Start Track</button>
-          <button id="objectMovedBtn" class="btn secondary" disabled style="display: none;">Object Moved</button>
-          <button id="stopBtn" class="btn danger" style="display: none;">Stop Agent</button>
+          <label class="target-row" for="targetInput">
+            Target
+            <input id="targetInput" class="target-input" type="text" maxlength="120" placeholder="e.g. a blue bottle" value="a blue bottle" />
+          </label>
+          <div class="control-buttons">
+            <button id="startShootBtn" class="btn primary">Start Shoot</button>
+            <button id="startTrackBtn" class="btn primary">Start Track</button>
+            <button id="objectMovedBtn" class="btn secondary" disabled style="display: none;">Object Moved</button>
+            <button id="stopBtn" class="btn danger" style="display: none;">Stop Agent</button>
+          </div>
         </div>
       </section>
     </main>

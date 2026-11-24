@@ -488,10 +488,11 @@ def load_text(path, strip_frontmatter: bool = True) -> Optional[str]:
 
 def make_addendum(args, w: int, h: int, hfov: float, caps: dict) -> str:
     """Run parameters only. The procedure and rules live in skills.md."""
+    target = (args.target or "").strip() or "a blue bottle"
     text = f"""RUN PARAMETERS (numbers for this run; the playbook above explains how to use them)
 - run mode: {args.run_mode}
 - image: {w}x{h} px
-- target: a blue bottle
+- target: {target}
 - rotate_robot: minimum {MIN_ROTATE_DEG:g}, at most {caps['rot']:g} degrees per step
 - pan_camera: servo range {caps['pan_min']}-{caps['pan_max']}, at most {caps['pan_step']:g} units per step
 - move_*: at most {caps['move']:g} m per step
@@ -1238,6 +1239,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skills", default=str(Path(__file__).with_name("skills.md")), help="playbook file")
     ap.add_argument("--run-mode", default="shoot", choices=["shoot", "track"],
                     help="shoot = round-based first-hit mode, track = continuous follow mode")
+    ap.add_argument("--target", default="a blue bottle",
+                    help="natural-language description of the visual target object")
     ap.add_argument("--learned", default="learned.md", help="learned notes file, rewritten after every run")
     ap.add_argument("--no-learn", action="store_true", help="baseline: ignore past runs, no learned notes")
     ap.add_argument("--learn-window", type=int, default=20, help="newest episodes in --out to learn from")
